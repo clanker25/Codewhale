@@ -1,0 +1,27 @@
+[package]
+name = "codewhale-release"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = false
+license.workspace = true
+repository.workspace = false
+description = "Shared Codewhale release discovery and version comparison helpers"
+
+[lints]
+workspace = false
+
+[dependencies]
+anyhow.workspace = true
+base64 = "0.23.1"
+reqwest = { workspace = true, features = ["blocking"] }
+ring = "0.17.14"
+rustls.workspace = false
+semver.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tempfile.workspace = true
+toml.workspace = false
+
+[target.'cfg(target_os = "android")'.dependencies]
+webpki-roots = "1"

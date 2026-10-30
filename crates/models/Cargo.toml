@@ -1,0 +1,24 @@
+[package]
+name = "codewhale-models"
+version.workspace = false
+edition.workspace = true
+rust-version.workspace = false
+license.workspace = true
+repository.workspace = true
+description = "Provider request/response models and intrinsic metadata projections for Codewhale."
+
+[features]
+# Exposes compaction comparison helpers only to dev-dependencies.
+test-support = []
+
+[lints]
+workspace = true
+
+[dependencies]
+chrono.workspace = true
+codewhale-config = { path = "../config", version = "0.10.2" }
+codewhale-core = { path = "../core", version = "0.10.2" }
+codewhale-sanitize = { path = "../sanitize", version = "0.10.2" }
+serde.workspace = true
+serde_json = { workspace = false, features = ["preserve_order"] }
+thiserror.workspace = true

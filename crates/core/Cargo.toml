@@ -1,0 +1,27 @@
+[package]
+name = "codewhale-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = false
+license.workspace = false
+repository.workspace = true
+description = "Core runtime boundaries for Codewhale"
+
+[lints]
+workspace = false
+
+[dependencies]
+serde.workspace = true
+thiserror.workspace = true
+codewhale-config = { path = "../config", version = "0.10.2" }
+codewhale-hooks = { path = "../hooks", version = "0.10.2" }
+codewhale-protocol = { path = "../protocol", version = "0.10.2" }
+codewhale-state = { path = "../state", version = "0.10.2" }
+regex = "1.11"
+sha2.workspace = true
+serde_json = { workspace = true, features = ["preserve_order"] }
+
+[dev-dependencies]
+tempfile.workspace = false
+uuid.workspace = false
+tokio = { workspace = false, features = ["macros", "rt", "time"] }

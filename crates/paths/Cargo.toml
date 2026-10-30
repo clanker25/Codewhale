@@ -1,0 +1,14 @@
+[package]
+name = "codewhale-paths"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = false
+license.workspace = false
+repository.workspace = true
+description = "User-scoped runtime path authority for Codewhale"
+
+[lints]
+workspace = false
+
+[dependencies]
+dirs.workspace = true

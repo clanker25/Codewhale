@@ -1,0 +1,73 @@
+import type { ChromeDict } from "../types";
+
+/**
+ * Hindi chrome dictionary.
+ *
+ * मानक हिन्दी, तुरंत-बरती तकनीकी शब्दावली के साथ — TUI पैक
+ * (crates/tui/locales/hi.json) के रजिस्टर से मेल खाता हुआ: «समीक्षा करें»,
+ * «चलाएँ»। अंग्रेज़ी की वर्तमान दिशा दर्शाती मूल पुनर्लेखन — कोई भी मॉडल,
+ * आपकी मशीन पर।
+ *
+ * मोड और अनुमति-मुद्रा (posture) literal रहते हैं (Plan / Work / Operate,
+ * Ask / Auto-Review / Full Access); `Runtime`, `fleet`, `TUI` उत्पाद-नाम
+ * हैं और ऐसे ही रहते हैं।
+ *
+ * सेकेंडरी नेविगेशन लेबल हिन्दी मुख्य लेबल के साथ छोटा अंग्रेज़ी साथी
+ * रखते हैं — हन जोड़ी अंग्रेज़ी संस्करण का अपना संपादकीय उपकरण है।
+ */
+export const chrome: ChromeDict = {
+  navDocs: "दस्तावेज़ीकरण",
+  navStart: "शुरुआत",
+  navInstall: "इंस्टॉल",
+  navFaq: "सामान्य प्रश्न",
+  navCommunity: "समुदाय",
+  navContribute: "योगदान",
+
+  navFeatures: "क्षमताएँ",
+  navProduct: "उत्पाद",
+  navModels: "मॉडल",
+  navPlugins: "प्लगइन",
+
+  skipToContent: "मुख्य सामग्री पर जाएँ",
+
+  navPrimaryAria: "मुख्य नेविगेशन",
+  navHomeAria: "Codewhale होम",
+
+  installCta: "इंस्टॉल करें →",
+
+  dateLocale: "hi-IN",
+
+  menuOpen: "मेनू खोलें",
+  menuClose: "मेनू बंद करें",
+
+  themeAuto: "ऑटो",
+  themeLight: "लाइट",
+  themeDark: "डार्क",
+  themeAria: "थीम: {mode} (बदलने के लिए क्लिक करें)",
+  themeTitle: "थीम · ऑटो / लाइट / डार्क",
+
+  footerTagline:
+    "आपके टर्मिनल और आपकी पसंद के मॉडल के लिए ओपन-सोर्स कोडिंग एजेंट।",
+  footerProduct: "उत्पाद",
+  footerProject: "प्रोजेक्ट",
+  footerDocs: "दस्तावेज़ीकरण",
+  footerGuide: "शुरुआत कैसे करें",
+  footerInstall: "इंस्टॉल",
+  footerModels: "मॉडल",
+  footerRuntime: "Runtime",
+  footerFaq: "सामान्य प्रश्न",
+  footerIssues: "Issues",
+  footerContribute: "योगदान दें",
+  footerLicense: "MIT लाइसेंस",
+  footerTerms: "सेवा की शर्तें",
+  footerPrivacy: "गोपनीयता",
+  footerChangelog: "परिवर्तन लॉग",
+  footerCanonicalSource: "कैननिकल सोर्स: ",
+  footerReleases: " · रिलीज़: ",
+  footerReleasesLink: "GitHub रिलीज़",
+  footerSecurity: "सुरक्षा",
+
+  switcherLabel: "भाषा",
+  switcherSwitchTo: "{label} पर स्विच करें",
+  partialBadge: "(आंशिक)",
+};

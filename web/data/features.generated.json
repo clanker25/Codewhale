@@ -1,0 +1,1209 @@
+{
+  "format": "codewhale.features.v1",
+  "source": {
+    "path": "docs/features.toml",
+    "sha256": "5c6c59e71bf5cf7636f470a4f1c175a310e010b42019cf69c60c1779a0480fa5"
+  },
+  "features": [
+    {
+      "id": "unix-uninstall",
+      "name": "Receipt-owned uninstall",
+      "summary": "Remove a receipt-owned release install or print its package manager's command; data kept unless --purge-data.",
+      "status": "experimental",
+      "surfaces": {
+        "tui": "preview"
+      },
+      "since": "unreleased",
+      "flag": null,
+      "docs": "docs/INSTALL.md",
+      "registryLine": 40
+    },
+    {
+      "id": "install-cleanup",
+      "name": "Installation cleanup",
+      "summary": "doctor --all expands diagnostics; --installs lists owners, --fix recovers old copies and --restore reverses it.",
+      "status": "stable",
+      "surfaces": {
+        "tui": "stable"
+      },
+      "since": "unreleased",
+      "flag": null,
+      "docs": "docs/INSTALL.md#clean-up-old-copies",
+      "registryLine": 50
+    },
+    {
+      "id": "auto-update",
+      "name": "Automatic updates",
+      "summary": "Release-binary installs download updates in the background and apply them at the next start; update --rollback undoes.",
+      "status": "stable",
+      "surfaces": {
+        "tui": "stable"
+      },
+      "since": "unreleased",
+      "flag": null,
+      "docs": "docs/INSTALL.md#automatic-updates",
+      "registryLine": 60
+    },
+    {
+      "id": "cloud-computer-dispatch",
+      "name": "Cloud computer conversations",
+      "summary": "Dispatch, inspect, continue and stop one account cloud conversation from terminal and desktop, saved whales included.",
+      "status": "experimental",
+      "surfaces": {
+        "tui": "preview"
+      },
+      "since": "unreleased",
+      "flag": null,
+      "docs": "docs/CLOUD_DISPATCH.md",
+      "registryLine": 70
+    },
+    {
+      "id": "shell-tool",
+      "name": "Shell tool",
+      "summary": "Runs shell commands for the agent through the approval gate and sandbox.",
+      "status": "stable",
+      "surfaces": {
+        "tui": "stable"
+      },
+      "since": "0.1.0",
+      "flag": "shell_tool",
+      "docs": "docs/TOOL_SURFACE.md",
+      "registryLine": 70
+    },
+    {
+      "id": "local-code-execution",
+      "name": "Local code execution",
+      "summary": "Runs Python and Node with the shared execution policy and explicitly approved per-call elevation.",
+      "status": "stable",
+      "surfaces": {
+        "tui": "stable"
+      },
+      "since": null,
+      "flag": null,
+      "docs": "docs/TOOL_SURFACE.md#local-code-execution",
+      "registryLine": 91
+    },
+    {
+      "id": "subagents",
+      "name": "Sub-agents",
+      "summary": "Delegates bounded work to background child agents with their own budgets.",
+      "status": "stable",
+      "surfaces": {
+        "tui": "stable",
+        "api": "stable"
+      },
+      "since": "0.1.0",
+      "flag": "subagents",
+      "docs": "docs/SUBAGENTS.md",
+      "registryLine": 200
+    },
+    {
+      "id": "web-search",
+      "name": "Web search",
+      "summary": "Searches and fetches the web for the agent, including DeepSeek Search (web.run, with the web_search alias).",
+      "status": "stable",
+      "surfaces": {
+        "tui": "stable"
+      },
+      "since": "0.1.0",
+      "flag": "web_search",
+      "docs": "docs/TOOL_SURFACE.md",
+      "registryLine": 111
+    },
+    {
+      "id": "apply-patch",
+      "name": "apply_patch",
+      "summary": "Edits files with structured patches the user can review and undo.",
+      "status": "stable",
+      "surfaces": {
+        "tui": "stable"
+      },
+      "since": "0.1.0",
+      "flag": "apply_patch",
+      "docs": "docs/TOOL_SURFACE.md",
+      "registryLine": 122
+    },
+    {
+      "id": "mcp-client",
+      "name": "MCP client",
+      "summary": "Connects MCP servers, exposes permitted tools and records connection status for the model.",
+      "status": "stable",
+      "surfaces": {
+        "tui": "stable",
+        "api": "stable"
+      },
+      "since": "0.1.0",
+      "flag": "mcp",
+      "docs": "docs/MCP.md",
+      "registryLine": 133
+    },
+    {
+      "id": "exec-policy",
+      "name": "Execution policy",
+      "summary": "Decides allow, ask or deny for each tool call from layered permission rules.",
+      "status": "stable",
+      "surfaces": {
+        "tui": "stable"
+      },
+      "since": "0.1.0",
+      "flag": "exec_policy",
+      "docs": "docs/AUTHORIZATION_ORDER.md",
+      "registryLine": 144
+    },
+    {
+      "id": "vision-model",
+      "name": "Vision model",
+      "summary": "Routes image analysis to a separate vision-capable model configured in [vision_model].",
+      "status": "flagged",
+      "surfaces": {
+        "tui": "stable"
+      },
+      "since": "0.8.32",
+      "flag": "vision_model",
+      "docs": "docs/CONFIGURATION.md",
+      "registryLine": 155
+    },
+    {
+      "id": "verify-tool",
+      "name": "verify tool",
+      "summary": "Lets the agent ask for an adversarial self-critique of its own work.",
+      "status": "stable",
+      "surfaces": {
+        "tui": "stable"
+      },
+      "since": "0.9.2",
+      "flag": "verify_tool",
+      "docs": "docs/CONFIGURATION.md#feature-flags",
+      "registryLine": 166
+    },
+    {
+      "id": "code-mode",
+      "name": "Code mode",
+      "summary": "execute_tools programs compose MCP, plugin and native tool calls under the normal gate.",
+      "status": "experimental",
+      "surfaces": {
+        "tui": "stable"
+      },
+      "since": "0.10.0",
+      "flag": "code_mode",
+      "docs": "docs/TOOL_SURFACE.md#code-mode-execute_tools",
+      "registryLine": 177
+    },
+    {
+      "id": "extension-host",
+      "name": "Extension host",
+      "summary": "Runs reviewed TypeScript/JavaScript tools, commands and bounded Git review scopes through Engine approvals in a sidecar.",
+      "status": "flagged",
+      "surfaces": {
+        "tui": "preview",
+        "web": "none",
+        "api": "preview"
+      },
+      "since": "0.10.1",
+      "flag": "extension_host",
+      "docs": "docs/EXTENSIONS.md",
+      "registryLine": 187
+    },
+    {
+      "id": "finance-host",
+      "name": "Finance host",
+      "summary": "Routes opted-in finance tools through the bundled Native host under the existing permission and sandbox gates.",
+      "status": "flagged",
+      "surfaces": {
+        "tui": "preview",
+        "api": "preview"
+      },
+      "since": "0.10.1",
+      "flag": "finance_host",
+      "docs": "docs/TOOL_SURFACE.md",
+      "registryLine": 199
+    },
+    {
+      "id": "data-host",
+      "name": "Data host",
+      "summary": "Routes opted-in data validation through the bundled Native host with owned input and output bounds.",
+      "status": "flagged",
+      "surfaces": {
+        "tui": "preview",
+        "api": "preview"
+      },
+      "since": "0.10.1",
+      "flag": "data_host",
+      "docs": "docs/TOOL_SURFACE.md",
+      "registryLine": 210
+    },
+    {
+      "id": "speech-host",
+      "name": "Speech host",
+      "summary": "Routes opted-in speech tools through the bundled Native host while Rust retains credentials and permissions.",
+      "status": "flagged",
+      "surfaces": {
+        "tui": "preview",
+        "api": "preview"
+      },
+      "since": "0.10.1",
+      "flag": "speech_host",
+      "docs": "docs/TOOL_SURFACE.md",
+      "registryLine": 221
+    },
+    {
+      "id": "pdf-host",
+      "name": "PDF host",
+      "summary": "Routes opted-in PDF extraction through the bundled Native host with the same Rust path and size guards.",
+      "status": "flagged",
+      "surfaces": {
+        "tui": "preview",
+        "api": "preview"
+      },
+      "since": "0.10.1",
+      "flag": "pdf_host",
+      "docs": "docs/TOOL_SURFACE.md",
+      "registryLine": 232
+    },
+    {
+      "id": "ocr-host",
+      "name": "OCR host",
+      "summary": "Routes opted-in image OCR through the bundled Native host under existing media and permission guards.",
+      "status": "flagged",
+      "surfaces": {
+        "tui": "preview",
+        "api": "preview"
+      },
+      "since": "0.10.1",
+      "flag": "ocr_host",
+      "docs": "docs/TOOL_SURFACE.md",
+      "registryLine": 243
+    },
+    {
+      "id": "github-host",
+      "name": "GitHub host",
+      "summary": "Routes opted-in GitHub operations through the bundled Native host while Rust retains credentials and approvals.",
+      "status": "flagged",
+      "surfaces": {
+        "tui": "preview",
+        "api": "preview"
+      },
+      "since": "0.10.1",
+      "flag": "github_host",
+      "docs": "docs/TOOL_SURFACE.md",
+      "registryLine": 254
+    },
+    {
+      "id": "web-search-host",
+      "name": "Web search host",
+      "summary": "Routes opted-in web search through the bundled Native host with the existing Rust credential and network gates.",
+      "status": "flagged",
+      "surfaces": {
+        "tui": "preview",
+        "api": "preview"
+      },
+      "since": "0.10.1",
+      "flag": "web_search_host",
+      "docs": "docs/TOOL_SURFACE.md",
+      "registryLine": 265
+    },
+    {
+      "id": "web-extract-host",
+      "name": "Web extract host",
+      "summary": "Routes opted-in web extraction through the bundled Native host with owned URL and response bounds.",
+      "status": "flagged",
+      "surfaces": {
+        "tui": "preview",
+        "api": "preview"
+      },
+      "since": "0.10.1",
+      "flag": "web_extract_host",
+      "docs": "docs/TOOL_SURFACE.md",
+      "registryLine": 276
+    },
+    {
+      "id": "review-host",
+      "name": "Review host",
+      "summary": "Routes opted-in review tools through the bundled Native host while Rust retains route and permission authority.",
+      "status": "flagged",
+      "surfaces": {
+        "tui": "preview",
+        "api": "preview"
+      },
+      "since": "0.10.1",
+      "flag": "review_host",
+      "docs": "docs/TOOL_SURFACE.md",
+      "registryLine": 286
+    },
+    {
+      "id": "modes",
+      "name": "Modes",
+      "summary": "Plan, Work and Operate modes set what the agent may do in a session; a finished plan offers to start the work.",
+      "status": "stable",
+      "surfaces": {
+        "tui": "stable",
+        "api": "stable"
+      },
+      "since": null,
+      "flag": null,
+      "docs": "docs/MODES.md",
+      "registryLine": 300
+    },
+    {
+      "id": "permission-postures",
+      "name": "Permission postures",
+      "summary": "Ask, Auto-Review and Full Access govern approvals; cards default to Deny and preview saved grants.",
+      "status": "stable",
+      "surfaces": {
+        "tui": "stable",
+        "api": "stable"
+      },
+      "since": null,
+      "flag": null,
+      "docs": "docs/MODES.md#permission-posture",
+      "registryLine": 309
+    },
+    {
+      "id": "sandbox",
+      "name": "Command sandbox",
+      "summary": "Seatbelt on macOS; verified bubblewrap on Linux by default. Sandboxed PTYs require util-linux setsid.",
+      "status": "stable",
+      "surfaces": {
+        "tui": "stable"
+      },
+      "since": null,
+      "flag": null,
+      "docs": "docs/SANDBOX.md",
+      "registryLine": 318
+    },
+    {
+      "id": "providers",
+      "name": "Providers",
+      "summary": "Provider routes including Runcrate, with scoped facts, limits, price estimates and a disclosed OrcaRouter offer.",
+      "status": "stable",
+      "surfaces": {
+        "tui": "stable",
+        "api": "stable"
+      },
+      "since": null,
+      "flag": null,
+      "docs": "docs/PROVIDERS.md",
+      "registryLine": 327
+    },
+    {
+      "id": "model-routing",
+      "name": "Auto model routing",
+      "summary": "Picks a model per turn under Auto; /router sets up the router.",
+      "status": "stable",
+      "surfaces": {
+        "tui": "stable"
+      },
+      "since": null,
+      "flag": null,
+      "docs": "docs/CONFIGURATION.md#auto-model-routing-auto-autorouter",
+      "registryLine": 336
+    },
+    {
+      "id": "output-limit-answer-recovery",
+      "name": "Answerless output-limit recovery",
+      "summary": "Opt-in bounded answer retries after an output-limit stop, including Fleet, with request-scoped nudge receipts.",
+      "status": "flagged",
+      "surfaces": {
+        "tui": "preview",
+        "api": "preview"
+      },
+      "since": "unreleased",
+      "flag": null,
+      "docs": "docs/CONFIGURATION.md#reasoning-only-recovery-reasoning_only",
+      "registryLine": 345
+    },
+    {
+      "id": "fleet",
+      "name": "Fleet",
+      "summary": "Runs and supervises groups of worker agents with receipts and a pre-spend check.",
+      "status": "stable",
+      "surfaces": {
+        "tui": "stable",
+        "api": "stable"
+      },
+      "since": null,
+      "flag": null,
+      "docs": "docs/FLEET.md",
+      "registryLine": 354
+    },
+    {
+      "id": "environment-placement",
+      "name": "Environment-aware Fleet placement",
+      "summary": "Places Fleet tasks by environment requirements and connects explicitly configured workers through Tailscale.",
+      "status": "experimental",
+      "surfaces": {
+        "tui": "preview",
+        "api": "preview"
+      },
+      "since": null,
+      "flag": null,
+      "docs": "docs/ENVIRONMENTS.md#environment-aware-fleet-placement-preview",
+      "registryLine": 364
+    },
+    {
+      "id": "workflows",
+      "name": "Workflows",
+      "summary": "Checked-in .workflow.js scripts coordinate agents step by step.",
+      "status": "stable",
+      "surfaces": {
+        "tui": "stable"
+      },
+      "since": null,
+      "flag": null,
+      "docs": "docs/WORKFLOW_AUTHORING.md",
+      "registryLine": 373
+    },
+    {
+      "id": "automatic-workflows",
+      "name": "Automatic workflows",
+      "summary": "Turns a broad request into a compact Workflow plan without writing a script.",
+      "status": "stable",
+      "surfaces": {
+        "tui": "stable"
+      },
+      "since": null,
+      "flag": null,
+      "docs": "docs/AUTOMATIC_WORKFLOWS.md",
+      "registryLine": 382
+    },
+    {
+      "id": "goals",
+      "name": "Goals",
+      "summary": "/goal keeps the agent working toward one objective across turns.",
+      "status": "stable",
+      "surfaces": {
+        "tui": "stable",
+        "api": "stable"
+      },
+      "since": null,
+      "flag": null,
+      "docs": "docs/CONFIGURATION.md#goal-loop-goal",
+      "registryLine": 392
+    },
+    {
+      "id": "thread-scheduled-turns",
+      "name": "Reminders into the same thread",
+      "summary": "send_later, automations and /v1/triggers can deliver a scheduled message as a new turn in an existing thread.",
+      "status": "experimental",
+      "surfaces": {
+        "api": "preview"
+      },
+      "since": "unreleased",
+      "flag": null,
+      "docs": "docs/RUNTIME_API.md",
+      "registryLine": 400
+    },
+    {
+      "id": "task-suggestions",
+      "name": "Suggested tasks",
+      "summary": "The tasks tool's suggest action offers the person a task as a Start/Hide card; it starts nothing and needs no approval.",
+      "status": "experimental",
+      "surfaces": {
+        "desktop": "preview"
+      },
+      "since": "unreleased",
+      "flag": null,
+      "docs": null,
+      "registryLine": 420
+    },
+    {
+      "id": "todos",
+      "name": "Todo list",
+      "summary": "The agent keeps a visible todo list for multi-step work.",
+      "status": "stable",
+      "surfaces": {
+        "tui": "stable",
+        "api": "stable"
+      },
+      "since": null,
+      "flag": null,
+      "docs": "docs/TOOL_SURFACE.md",
+      "registryLine": 419
+    },
+    {
+      "id": "composer-queue-steer",
+      "name": "Queue and steer",
+      "summary": "Queue messages while a turn runs, or steer the running turn.",
+      "status": "stable",
+      "surfaces": {
+        "tui": "stable",
+        "api": "stable"
+      },
+      "since": null,
+      "flag": null,
+      "docs": "docs/KEYBINDINGS.md",
+      "registryLine": 428
+    },
+    {
+      "id": "receipts",
+      "name": "Receipts",
+      "summary": "/receipts lists what a session did: files, commands, calls, approvals and failures.",
+      "status": "stable",
+      "surfaces": {
+        "tui": "stable",
+        "api": "stable"
+      },
+      "since": "0.10.1",
+      "flag": null,
+      "docs": "docs/RECEIPTS.md",
+      "registryLine": 438
+    },
+    {
+      "id": "preview-request",
+      "name": "Request preview",
+      "summary": "/preview-request shows the redacted outbound request without sending it.",
+      "status": "stable",
+      "surfaces": {
+        "tui": "stable"
+      },
+      "since": null,
+      "flag": null,
+      "docs": "docs/PREVIEW_REQUEST.md",
+      "registryLine": 447
+    },
+    {
+      "id": "read-media",
+      "name": "read_media",
+      "summary": "Reads and preprocesses images for vision-capable models with size and privacy guards.",
+      "status": "stable",
+      "surfaces": {
+        "tui": "stable"
+      },
+      "since": null,
+      "flag": null,
+      "docs": "docs/READ_MEDIA.md",
+      "registryLine": 456
+    },
+    {
+      "id": "memory",
+      "name": "User memory",
+      "summary": "Opt-in local store of preferences and conventions that persists across sessions.",
+      "status": "flagged",
+      "surfaces": {
+        "tui": "stable",
+        "api": "stable"
+      },
+      "since": null,
+      "flag": null,
+      "docs": "docs/MEMORY.md",
+      "registryLine": 464
+    },
+    {
+      "id": "skills",
+      "name": "Skills",
+      "summary": "Trusted instruction packages with bundle policy, invocation controls and shared, configurable index limits.",
+      "status": "stable",
+      "surfaces": {
+        "tui": "stable",
+        "api": "stable"
+      },
+      "since": null,
+      "flag": null,
+      "docs": "docs/SKILLS.md",
+      "registryLine": 476
+    },
+    {
+      "id": "plugins",
+      "name": "Plugins",
+      "summary": "Installs, reviews and trusts plugin bundles, including the first-party marketplace.",
+      "status": "stable",
+      "surfaces": {
+        "tui": "stable",
+        "api": "stable"
+      },
+      "since": null,
+      "flag": null,
+      "docs": "docs/PLUGINS.md",
+      "registryLine": 485
+    },
+    {
+      "id": "computer-use",
+      "name": "Computer Use",
+      "summary": "Reviewed app control: one approval covers background and foreground use, fresh targets, bounded batches.",
+      "status": "experimental",
+      "surfaces": {
+        "tui": "preview",
+        "api": "preview"
+      },
+      "since": null,
+      "flag": null,
+      "docs": "docs/PLUGIN_BUNDLES.md",
+      "registryLine": 494
+    },
+    {
+      "id": "script-tools",
+      "name": "Script tools",
+      "summary": "Scripts in ~/.codewhale/tools become approval-gated tools; [tools.overrides] disables built-ins, never replaces them.",
+      "status": "stable",
+      "surfaces": {
+        "tui": "stable"
+      },
+      "since": null,
+      "flag": null,
+      "docs": "docs/CONFIGURATION.md#script-tools-and-overrides",
+      "registryLine": 503
+    },
+    {
+      "id": "claude-plugin-compat",
+      "name": "Claude plugin compatibility",
+      "summary": "Loads Claude Code plugin bundles and skill folders where their features are supported.",
+      "status": "stable",
+      "surfaces": {
+        "tui": "stable"
+      },
+      "since": null,
+      "flag": null,
+      "docs": "docs/CLAUDE_PLUGIN_COMPAT.md",
+      "registryLine": 512
+    },
+    {
+      "id": "claude-settings-import",
+      "name": "Claude settings import",
+      "summary": "/import-claude plans a reviewable import of Claude Code settings and servers.",
+      "status": "stable",
+      "surfaces": {
+        "tui": "stable"
+      },
+      "since": null,
+      "flag": null,
+      "docs": null,
+      "registryLine": 522
+    },
+    {
+      "id": "hooks",
+      "name": "Hooks",
+      "summary": "Runs user commands on session and tool events, with an execution receipt after shell tools.",
+      "status": "stable",
+      "surfaces": {
+        "tui": "stable",
+        "api": "stable"
+      },
+      "since": null,
+      "flag": null,
+      "docs": "docs/HOOKS.md",
+      "registryLine": 529
+    },
+    {
+      "id": "lsp",
+      "name": "LSP diagnostics",
+      "summary": "Feeds language-server diagnostics to the agent; custom servers can be added.",
+      "status": "stable",
+      "surfaces": {
+        "tui": "stable",
+        "api": "stable"
+      },
+      "since": null,
+      "flag": null,
+      "docs": "docs/LSP_PHP_CUSTOM.md",
+      "registryLine": 538
+    },
+    {
+      "id": "runtime-api",
+      "name": "Runtime API",
+      "summary": "Local API: replay-safe thread creation, events, approvals, project trust, workspace leases, Unix sockets, device tokens.",
+      "status": "stable",
+      "surfaces": {
+        "api": "stable"
+      },
+      "since": null,
+      "flag": null,
+      "docs": "docs/RUNTIME_API.md",
+      "registryLine": 546
+    },
+    {
+      "id": "compatibility-tool-free-turns",
+      "name": "Compatibility turn admission",
+      "summary": "Compatibility transports require explicit tool-free turns; interactive clients use the full HTTP/SSE API.",
+      "status": "stable",
+      "surfaces": {
+        "api": "stable"
+      },
+      "since": "0.10.2",
+      "flag": null,
+      "docs": "docs/RUNTIME_API.md#compatibility-execution-limits",
+      "registryLine": 556
+    },
+    {
+      "id": "runtime-provider-keys",
+      "name": "Runtime provider keys",
+      "summary": "Runtime API provider keys: durable or process-only memory, with a session-only policy that disables stored fallback.",
+      "status": "stable",
+      "surfaces": {
+        "api": "stable"
+      },
+      "since": "0.10.2",
+      "flag": null,
+      "docs": "docs/RUNTIME_API.md#put-v1providersidkey--write-only-credential",
+      "registryLine": 566
+    },
+    {
+      "id": "headless-exec",
+      "name": "Headless exec",
+      "summary": "codewhale exec runs one headless turn from a script and streams JSON.",
+      "status": "stable",
+      "surfaces": {
+        "tui": "stable"
+      },
+      "since": null,
+      "flag": null,
+      "docs": "docs/RUNTIME_API.md",
+      "registryLine": 576
+    },
+    {
+      "id": "github-review",
+      "name": "GitHub PR review",
+      "summary": "codewhale review --pr N writes an advisory review; posting to GitHub is opt-in.",
+      "status": "stable",
+      "surfaces": {
+        "tui": "stable"
+      },
+      "since": null,
+      "flag": null,
+      "docs": "docs/GITHUB_APP.md",
+      "registryLine": 585
+    },
+    {
+      "id": "web-client",
+      "name": "Local browser client",
+      "summary": "codewhale web opens the embedded browser client on 127.0.0.1 over the Runtime API.",
+      "status": "stable",
+      "surfaces": {
+        "web": "stable"
+      },
+      "since": null,
+      "flag": null,
+      "docs": "docs/WEB.md",
+      "registryLine": 596
+    },
+    {
+      "id": "keybindings",
+      "name": "Keybindings",
+      "summary": "Terminal key bindings, documented from the keybinding catalog.",
+      "status": "stable",
+      "surfaces": {
+        "tui": "stable"
+      },
+      "since": null,
+      "flag": null,
+      "docs": "docs/KEYBINDINGS.md",
+      "registryLine": 605
+    },
+    {
+      "id": "settings",
+      "name": "Settings",
+      "summary": "/config and codewhale config edit settings declared once in the settings schema.",
+      "status": "stable",
+      "surfaces": {
+        "tui": "stable",
+        "api": "stable"
+      },
+      "since": null,
+      "flag": null,
+      "docs": "docs/CONFIGURATION.md",
+      "registryLine": 614
+    },
+    {
+      "id": "whats-new-notice",
+      "name": "What's new after an update",
+      "summary": "Says once, on the first start after an update, what changed and links that version's release notes.",
+      "status": "stable",
+      "surfaces": {
+        "tui": "stable"
+      },
+      "since": "0.10.2",
+      "flag": null,
+      "docs": "docs/CONFIGURATION.md#whats-new-after-an-update",
+      "registryLine": 623
+    },
+    {
+      "id": "themes",
+      "name": "Themes",
+      "summary": "/theme picks a built-in theme; user themes follow a JSON schema.",
+      "status": "stable",
+      "surfaces": {
+        "tui": "stable"
+      },
+      "since": null,
+      "flag": null,
+      "docs": "docs/schemas/user-theme.schema.json",
+      "registryLine": 633
+    },
+    {
+      "id": "chat-color",
+      "name": "Chat color",
+      "summary": "/color gives one chat's composer box its own color, kept with that session.",
+      "status": "stable",
+      "surfaces": {
+        "tui": "stable"
+      },
+      "since": "0.10.2",
+      "flag": null,
+      "docs": "docs/GUIDE.md",
+      "registryLine": 642
+    },
+    {
+      "id": "localization",
+      "name": "Localization",
+      "summary": "Interface text in 15 locales, including tool activity, file receipts and language-aware transcript caches.",
+      "status": "stable",
+      "surfaces": {
+        "tui": "stable"
+      },
+      "since": null,
+      "flag": null,
+      "docs": "docs/LOCALIZATION.md",
+      "registryLine": 652
+    },
+    {
+      "id": "voice",
+      "name": "Voice input",
+      "summary": "/voice, /voicecontrol and /voicesend use the selected ASR backend without switching providers.",
+      "status": "stable",
+      "surfaces": {
+        "tui": "stable",
+        "api": "stable"
+      },
+      "since": null,
+      "flag": null,
+      "docs": null,
+      "registryLine": 661
+    },
+    {
+      "id": "pet",
+      "name": "Pet",
+      "summary": "Shared whale activity and reply views; desktop and app-server turns can follow an idle existing companion.",
+      "status": "stable",
+      "surfaces": {
+        "tui": "stable",
+        "api": "partial"
+      },
+      "since": null,
+      "flag": null,
+      "docs": "docs/PET_MODE.md",
+      "registryLine": 669
+    },
+    {
+      "id": "overview",
+      "name": "Home dashboard",
+      "summary": "/overview shows the home dashboard.",
+      "status": "stable",
+      "surfaces": {
+        "tui": "stable"
+      },
+      "since": null,
+      "flag": null,
+      "docs": "docs/PROVIDERS.md",
+      "registryLine": 678
+    },
+    {
+      "id": "account-login",
+      "name": "Account login",
+      "summary": "/login signs in to an optional Codewhale account; plugin providers connect with /connect.",
+      "status": "stable",
+      "surfaces": {
+        "tui": "stable"
+      },
+      "since": null,
+      "flag": null,
+      "docs": null,
+      "registryLine": 687
+    },
+    {
+      "id": "account-computer-files",
+      "name": "Account computer files",
+      "summary": "Save computer files as account versions, restore with revision checks, and download verified bytes.",
+      "status": "experimental",
+      "surfaces": {
+        "tui": "preview"
+      },
+      "since": "0.10.2",
+      "flag": null,
+      "docs": null,
+      "registryLine": 695
+    },
+    {
+      "id": "context-anchors",
+      "name": "Context anchors",
+      "summary": "/anchor pins a fact that survives compaction.",
+      "status": "stable",
+      "surfaces": {
+        "tui": "stable"
+      },
+      "since": null,
+      "flag": null,
+      "docs": null,
+      "registryLine": 703
+    },
+    {
+      "id": "window-pin",
+      "name": "Pin window",
+      "summary": "/pin keeps the terminal window on top.",
+      "status": "stable",
+      "surfaces": {
+        "tui": "stable"
+      },
+      "since": null,
+      "flag": null,
+      "docs": null,
+      "registryLine": 712
+    },
+    {
+      "id": "structured-copy",
+      "name": "Structured copy",
+      "summary": "/structcopy copies one session object as redacted JSON.",
+      "status": "stable",
+      "surfaces": {
+        "tui": "stable"
+      },
+      "since": null,
+      "flag": null,
+      "docs": null,
+      "registryLine": 720
+    },
+    {
+      "id": "live-thinking",
+      "name": "Live thinking",
+      "summary": "/verbose toggles live model thinking in the transcript.",
+      "status": "stable",
+      "surfaces": {
+        "tui": "stable"
+      },
+      "since": null,
+      "flag": null,
+      "docs": null,
+      "registryLine": 728
+    },
+    {
+      "id": "workbar",
+      "name": "Workbar",
+      "summary": "/workbar places the tasks, agents and context bar on any edge or hides it.",
+      "status": "stable",
+      "surfaces": {
+        "tui": "stable"
+      },
+      "since": null,
+      "flag": null,
+      "docs": null,
+      "registryLine": 736
+    },
+    {
+      "id": "terminal-dock",
+      "name": "Terminal dock",
+      "summary": "/workbar terminal shows workspace PTYs with live output, human input, session selection and a fresh shell; macOS/Linux.",
+      "status": "stable",
+      "surfaces": {
+        "tui": "stable"
+      },
+      "since": "0.10.2",
+      "flag": null,
+      "docs": null,
+      "registryLine": 743
+    },
+    {
+      "id": "telemetry",
+      "name": "Telemetry",
+      "summary": "Anonymous aggregate usage counts, disclosed at first launch, with a saved off switch.",
+      "status": "stable",
+      "surfaces": {
+        "tui": "stable"
+      },
+      "since": null,
+      "flag": null,
+      "docs": "docs/TELEMETRY.md",
+      "registryLine": 755
+    },
+    {
+      "id": "docker",
+      "name": "Docker image",
+      "summary": "Runs Codewhale in a container, with an opt-in toolbox image.",
+      "status": "stable",
+      "surfaces": {
+        "tui": "stable"
+      },
+      "since": null,
+      "flag": null,
+      "docs": "docs/DOCKER.md",
+      "registryLine": 765
+    },
+    {
+      "id": "termux",
+      "name": "Android (Termux)",
+      "summary": "arm64 release archive for Termux on Android.",
+      "status": "experimental",
+      "surfaces": {
+        "tui": "preview"
+      },
+      "since": null,
+      "flag": null,
+      "docs": "docs/TERMUX.md",
+      "registryLine": 772
+    },
+    {
+      "id": "chatgpt-plan-sign-in",
+      "name": "Sign in with ChatGPT",
+      "summary": "Uses official OAuth and the selected account catalog for eligible ChatGPT plan requests in the local OSS app.",
+      "status": "experimental",
+      "surfaces": {
+        "tui": "preview",
+        "api": "partial",
+        "web": "none"
+      },
+      "since": "0.10.1",
+      "flag": null,
+      "docs": "docs/PROVIDERS.md#sign-in-with-chatgpt",
+      "registryLine": 782
+    },
+    {
+      "id": "claude-plan-sign-in",
+      "name": "Sign in with Claude",
+      "summary": "Adds Claude subscription sign-in and native Messages routing. Live provider acceptance remains unverified.",
+      "status": "experimental",
+      "surfaces": {
+        "tui": "preview",
+        "api": "partial",
+        "web": "none"
+      },
+      "since": "0.10.2",
+      "flag": null,
+      "docs": "docs/PROVIDERS.md#sign-in-with-claude",
+      "registryLine": 792
+    },
+    {
+      "id": "plugin-oauth-providers",
+      "name": "Reviewed plugin OAuth providers",
+      "summary": "Reviewed plugins sign in with /connect <id> and out with /disconnect; the host owns PKCE, models and approvals.",
+      "status": "experimental",
+      "surfaces": {
+        "tui": "preview",
+        "api": "partial",
+        "web": "none"
+      },
+      "since": "0.10.1",
+      "flag": null,
+      "docs": "docs/PLUGIN_PROVIDERS.md",
+      "registryLine": 802
+    },
+    {
+      "id": "orcarouter-sign-in",
+      "name": "Sign in with OrcaRouter",
+      "summary": "OrcaRouter provider: sk-orca- API key or OAuth 2.0 + PKCE sign-in, plus a live chat model catalog.",
+      "status": "experimental",
+      "surfaces": {
+        "tui": "preview",
+        "api": "preview",
+        "web": "none"
+      },
+      "since": "0.10.1",
+      "flag": null,
+      "docs": "docs/PROVIDERS.md",
+      "registryLine": 812
+    },
+    {
+      "id": "merch-interest",
+      "name": "Merch interest list",
+      "summary": "The community website collects private merch opt-ins, material preferences and optional item-price feedback.",
+      "status": "experimental",
+      "surfaces": {
+        "tui": "none",
+        "web": "none",
+        "api": "none"
+      },
+      "since": "unreleased",
+      "flag": null,
+      "docs": "web/lib/merch/README.md",
+      "registryLine": 823
+    },
+    {
+      "id": "profile-constitution",
+      "name": "Profile constitution",
+      "summary": "Account preferences are captured per turn and previewed by the Engine.",
+      "status": "experimental",
+      "surfaces": {
+        "tui": "preview",
+        "api": "preview"
+      },
+      "since": "0.10.1",
+      "flag": null,
+      "docs": "docs/RUNTIME_API.md#profile-constitution",
+      "registryLine": 833
+    },
+    {
+      "id": "plugin-shell-install",
+      "name": "Plugin shell installation",
+      "summary": "codewhale install uses the reviewed bundle installer with local, GitHub and version-pinned npm sources.",
+      "status": "experimental",
+      "surfaces": {
+        "tui": "preview"
+      },
+      "since": "0.10.2",
+      "flag": null,
+      "docs": "docs/PLUGINS.md",
+      "registryLine": 843
+    },
+    {
+      "id": "herdr-agent-state",
+      "name": "Herdr agent state",
+      "summary": "Reports idle, working or blocked to the Herdr multiplexer and reopens the session after a restart.",
+      "status": "stable",
+      "surfaces": {
+        "tui": "stable"
+      },
+      "since": "0.10.2",
+      "flag": null,
+      "docs": null,
+      "registryLine": 853
+    },
+    {
+      "id": "instruction-budgets",
+      "name": "Instruction budgets",
+      "summary": "Global and project standing instructions get separate token budgets, with every trim or skip reported.",
+      "status": "stable",
+      "surfaces": {
+        "tui": "stable"
+      },
+      "since": "unreleased",
+      "flag": null,
+      "docs": "docs/CONFIGURATION.md#instruction-budget-instruction_budget-6526",
+      "registryLine": 862
+    },
+    {
+      "id": "github-action-review",
+      "name": "GitHub Action review",
+      "summary": "Generate pinned workflows for automatic or authorized mention reviews; publish findings with recorded evidence.",
+      "status": "experimental",
+      "surfaces": {
+        "tui": "preview"
+      },
+      "since": "unreleased",
+      "flag": null,
+      "docs": "docs/GITHUB_ACTION.md",
+      "registryLine": 872
+    },
+    {
+      "id": "telegram-agent",
+      "name": "Telegram agent bridge",
+      "summary": "Use an Engine from Telegram with durable prompt recovery, human-owned approvals and retained replies.",
+      "status": "experimental",
+      "surfaces": {
+        "api": "preview"
+      },
+      "since": "unreleased",
+      "flag": null,
+      "docs": "integrations/telegram-bridge/README.md",
+      "registryLine": 882
+    },
+    {
+      "id": "dingtalk-agent",
+      "name": "DingTalk agent bridge",
+      "summary": "Connect an internal DingTalk app to the same Engine with scoped identity and durable message recovery.",
+      "status": "experimental",
+      "surfaces": {
+        "api": "preview"
+      },
+      "since": "unreleased",
+      "flag": null,
+      "docs": "integrations/dingtalk-bridge/README.md",
+      "registryLine": 892
+    }
+  ]
+}
