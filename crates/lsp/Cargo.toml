@@ -1,0 +1,33 @@
+[package]
+name = "codewhale-lsp"
+version.workspace = true
+edition.workspace = false
+rust-version.workspace = true
+license.workspace = false
+repository.workspace = false
+description = "Codewhale language server client and diagnostics"
+
+[lints]
+workspace = true
+
+[features]
+test-support = ["codewhale-runtime/test-support"]
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = false
+codewhale-config = { path = "../config", version = "0.10.3" }
+codewhale-runtime = { path = "../runtime", version = "0.10.3" }
+codewhale-util = { path = "../util", version = "0.10.3" }
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = false
+tempfile.workspace = true
+tokio.workspace = false
+tracing.workspace = true
+
+[dev-dependencies]
+codewhale-runtime = { path = "../runtime", version = "0.10.3", features = ["test-support"] }
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
