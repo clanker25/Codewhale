@@ -1,0 +1,31 @@
+
+ ╭ theme · live preview ──────────────────────────────────────────────────────────────────────────────────────── 5/17 ╮
+ │       1. System                                │ Underwater  ● active                                              │
+ │       2. Terminal                              │ The painted ocean field: ombre water, ambient life, the whale     │
+ │       3. Shoreline                             │                                                                   │
+ │       4. Shoreline Light                       │ Palette                                                           │
+ │  ▸ ●  5. Underwater                            │    Surface     Panel     Selection                                │
+ │       6. Underwater Retro                      │ ● Accent  ● Ready  ◆ Notice  ✕ Error                              │
+ │       7. Blue Stage                            │                                                                   │
+ │       8. Blue Stage Light                      │ Sample                                                            │
+ │       9. Grayscale                             │ Primary text · muted metadata                                     │
+ │      10. Catppuccin Mocha                      │  ▸ Selected row highlight                                         │
+ │      11. Tokyo Night                           │                                                                   │
+ │      12. Dracula                               │                                                                   │
+ │      13. Gruvbox Dark                          │                                                                   │
+ │      14. Claude                                │                                                                   │
+ │      15. Matrix                                │                                                                   │
+ │      16. Solarized Light                       │                                                                   │
+ │      17. Uwu                                   │                                                                   │
+ │                                                │                                                                   │
+ │                                                │                                                                   │
+ │                                                │                                                                   │
+ │                                                │                                                                   │
+ │                                                │                                                                   │
+ │                                                │                                                                   │
+ │                                                │                                                                   │
+ │                                                │                                                                   │
+ │                                                │                                                                   │
+ │                                                │                                                                   │
+ │ ↑/↓ preview · Enter save · Esc revert                                                                              │
+ ╰────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯

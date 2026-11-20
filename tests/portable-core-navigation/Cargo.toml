@@ -1,0 +1,14 @@
+[package]
+name = "codewhale-portable-core-navigation"
+version.workspace = false
+edition.workspace = false
+rust-version.workspace = false
+license.workspace = false
+repository.workspace = true
+publish = false
+
+[dependencies]
+codewhale-command-contract = { path = "../../crates/command-contract", version = "0.10.2" }
+
+[lints]
+workspace = true

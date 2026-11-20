@@ -1,0 +1,27 @@
+node_modules
+.next
+.open-next
+.wrangler
+.cloudflare
+.env
+.env.local
+.env.*.local
+*.log
+.DS_Store
+next-env.d.ts
+.vercel
+tsconfig.tsbuildinfo
+.dev.vars
+
+# Derived at build/test time from CHANGELOG.md, docs/INSTALL.md and the docs
+# sources named in lib/docs-map.ts. Not tracked: two PRs that each regenerated
+# a committed copy against their own base merged to a stale file and reddened
+# main (2026-09-26), and the docs snapshot embeds every registered page, so
+# any two docs changes conflicted on it. `npm run prebuild`, `npm run dev` and
+# the vitest global setup write them.
+data/agent-docs.generated.json
+lib/changelog.generated.ts
+lib/release-notes.generated.ts
+lib/install-guide.generated.ts
+
+lib/docs-preview.generated.ts
