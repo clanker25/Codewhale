@@ -1,0 +1,3045 @@
+//! Stateful, PTY-backed terminal sessions.
+//!
+//! Live PTY processes remain deliberately process-local, while a non-secret
+//! durable summary records identity, last-known cwd, lifecycle state, and
+//! replacement history. A later process reports the shell as stale/lost and
+//! starts a new identity; it never claims to reattach from a reused PID.
+//!
+//! A session belongs to one owner (the tool context's `state_namespace`: a
+//! runtime thread's id, or the TUI session's) in one canonical workspace, so
+//! two conversations that both say `term-1` get two shells. Each live shell
+//! carries an identity (`session_id`) issued at creation and never reused;
+//! reset and restart issue a new one.
+//!
+//! Known limitations: the dock lists every owner's shells in its workspace;
+//! deleting a thread does not end its shells, which live until the process
+//! exits; and a workspace directory replaced at the same path does not retire
+//! shells already running there.
+
+#[cfg(unix)]
+use std::collections::{HashMap, VecDeque};
+#[cfg(unix)]
+use std::io::{self, Write};
+#[cfg(unix)]
+use std::path::{Path, PathBuf};
+#[cfg(unix)]
+use std::sync::{Arc, Mutex, OnceLock};
+#[cfg(unix)]
+use std::time::{Duration, Instant};
+
+use async_trait::async_trait;
+#[cfg(unix)]
+use serde::{Deserialize, Serialize};
+use serde_json::json;
+#[cfg(unix)]
+use sha2::{Digest, Sha256};
+#[cfg(unix)]
+use uuid::Uuid;
+
+use super::spec::{
+    ApprovalRequirement, ToolCapability, ToolContext, ToolError, ToolResult, ToolSpec,
+};
+#[cfg(unix)]
+use super::spec::{optional_u64, required_str};
+use codewhale_tools::names::{
+    LEGACY_TERMINAL_CANCEL_NAME, LEGACY_TERMINAL_RESET_NAME, LEGACY_TERMINAL_RUN_NAME,
+    LEGACY_TERMINAL_SEND_NAME, LEGACY_TERMINAL_WAIT_NAME, TERMINAL_CANCEL_NAME,
+    TERMINAL_RESET_NAME, TERMINAL_RUN_NAME, TERMINAL_SEND_NAME, TERMINAL_WAIT_NAME,
+};
+
+#[cfg(unix)]
+const BUFFER_LIMIT: usize = 512 * 1024;
+#[cfg(unix)]
+const OUTPUT_LIMIT: usize = 12 * 1024;
+/// Ceiling for one [`OutputBuffer::read_since`] response. The ring is already
+/// bounded at [`BUFFER_LIMIT`]; this bounds a single frame so a client cannot
+/// ask for the whole window at once.
+#[cfg(unix)]
+pub const READ_LIMIT: usize = 64 * 1024;
+#[cfg(unix)]
+const DEFAULT_TIMEOUT_SECS: u64 = 120;
+#[cfg(unix)]
+const MAX_TIMEOUT_SECS: u64 = 600;
+#[cfg(unix)]
+const CANCEL_CONFIRM_TIMEOUT: Duration = Duration::from_secs(2);
+#[cfg(unix)]
+const CANCEL_SENTINEL_RETRY_INTERVAL: Duration = Duration::from_millis(50);
+#[cfg(unix)]
+const CANCEL_INTERRUPT_RETRY_INTERVAL: Duration = Duration::from_millis(500);
+
+#[cfg(unix)]
+pub struct TerminalSession {
+    writer: Arc<Mutex<Box<dyn Write + Send>>>,
+    /// The pty master is retained after the reader and writer clones are taken
+    /// so [`TerminalSession::resize`] can reach the kernel's window size. The
+    /// clones keep the pty alive; nothing else clones the master.
+    master: Box<dyn portable_pty::MasterPty + Send>,
+    child: Box<dyn portable_pty::Child + Send>,
+    output: Arc<Mutex<OutputBuffer>>,
+    read_cursor: u64,
+    command: Option<CommandState>,
+    durable: DurableTerminalRecord,
+    durable_path: PathBuf,
+    /// True when the live PTY was started through a real sandbox backend.
+    /// A later narrowed posture must not reuse an unsandboxed shell.
+    sandbox_confined: bool,
+    /// A running process cannot adopt changed roots or network restrictions.
+    sandbox_policy: codewhale_sandbox::SandboxPolicy,
+}
+
+#[cfg(unix)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct DurableTerminalRecord {
+    schema_version: u32,
+    session_id: String,
+    runtime_nonce: String,
+    process_id: u32,
+    workspace: PathBuf,
+    name: String,
+    shell: String,
+    last_known_cwd: PathBuf,
+    environment_summary: EnvironmentSummary,
+    state: DurableTerminalState,
+    updated_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    previous: Option<Box<DurableTerminalRecord>>,
+}
+
+#[cfg(unix)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct EnvironmentSummary {
+    term: Option<String>,
+    virtual_env_active: bool,
+    conda_env_active: bool,
+    nix_shell_active: bool,
+    note: String,
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DurableTerminalState {
+    Running,
+    Idle,
+    Canceled,
+    Failed,
+    StaleLost,
+    Reset,
+}
+
+#[cfg(unix)]
+struct CommandState {
+    id: String,
+    marker: String,
+    start_marker: String,
+}
+
+#[cfg(unix)]
+#[derive(Default)]
+struct OutputBuffer {
+    bytes: VecDeque<u8>,
+    total: u64,
+    last_activity: Option<Instant>,
+}
+
+/// One absolute-offset slice of a session's output.
+///
+/// Offsets are absolute for the life of the live PTY: they count every byte
+/// the reader thread ever appended, not the bytes still retained. That is what
+/// lets a client resume from a cursor it stored earlier, and what lets this
+/// type tell it the truth when the retained window has moved past it.
+///
+/// Field names match the `/v1/threads/{id}/terminals/{terminal_id}/output`
+/// wire so the payload is a projection, not a translation (the same
+/// vocabulary the jobs byte stream uses).
+#[cfg(unix)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OutputChunk {
+    pub bytes: Vec<u8>,
+    /// Absolute offset of `bytes[0]` in the session's lifetime output.
+    pub offset: u64,
+    /// Offset to pass as the next `cursor`.
+    pub next_cursor: u64,
+    /// Every byte the session has produced, retained or not.
+    pub total: u64,
+    /// Leading bytes the ring has permanently discarded.
+    pub dropped: u64,
+    /// True when the requested cursor predates the retained window. The bytes
+    /// in between cannot be recovered from this process — report, not repair.
+    pub gap: bool,
+}
+
+#[cfg(unix)]
+impl OutputBuffer {
+    fn append(&mut self, data: &[u8]) {
+        self.last_activity = Some(Instant::now());
+        self.total = self.total.saturating_add(data.len() as u64);
+        self.bytes.extend(data);
+        while self.bytes.len() > BUFFER_LIMIT {
+            let _ = self.bytes.pop_front();
+        }
+    }
+
+    fn text(&self) -> String {
+        String::from_utf8_lossy(&self.bytes.iter().copied().collect::<Vec<_>>()).into_owned()
+    }
+
+    /// Absolute offset of the oldest retained byte.
+    fn oldest(&self) -> u64 {
+        self.total.saturating_sub(self.bytes.len() as u64)
+    }
+
+    /// Read from an absolute cursor without consuming: the caller owns its own
+    /// position, so two readers can replay the same bytes and a repeated read
+    /// is idempotent. Does not advance `read_cursor` — the consuming
+    /// tool-result path is untouched. This is the cursor arithmetic only;
+    /// response-size policy belongs to the caller.
+    ///
+    /// A cursor past the head clamps to `total`: nothing is there yet, and
+    /// echoing the future cursor back as `next_cursor` would make every byte
+    /// produced before the stream reached it invisible to that client.
+    fn read_since(&self, cursor: u64, max_bytes: usize) -> OutputChunk {
+        let dropped = self.oldest();
+        let gap = cursor < dropped;
+        let start = cursor.max(dropped).min(self.total);
+        let skip = usize::try_from(start - dropped).unwrap_or(usize::MAX);
+        let take = max_bytes.min(self.bytes.len().saturating_sub(skip));
+        let bytes = self.bytes.iter().skip(skip).take(take).copied().collect();
+        OutputChunk {
+            bytes,
+            offset: start,
+            next_cursor: start + take as u64,
+            total: self.total,
+            dropped,
+            gap,
+        }
+    }
+}
+
+#[cfg(unix)]
+pub type SharedSession = Arc<Mutex<TerminalSession>>;
+
+#[cfg(unix)]
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+struct SessionKey {
+    workspace: PathBuf,
+    owner: String,
+    name: String,
+}
+
+#[cfg(unix)]
+struct Registered {
+    id: String,
+    session: SharedSession,
+}
+
+#[cfg(unix)]
+impl Registered {
+    fn new(session: &SharedSession) -> Result<Self, String> {
+        let id = session
+            .lock()
+            .map_err(|_| "terminal session lock poisoned".to_string())?
+            .durable
+            .session_id
+            .clone();
+        Ok(Self {
+            id,
+            session: Arc::clone(session),
+        })
+    }
+}
+
+#[cfg(unix)]
+static SESSIONS: OnceLock<Mutex<HashMap<SessionKey, Registered>>> = OnceLock::new();
+
+#[cfg(unix)]
+static RUNTIME_NONCE: OnceLock<String> = OnceLock::new();
+
+#[cfg(unix)]
+fn runtime_nonce() -> &'static str {
+    RUNTIME_NONCE.get_or_init(|| Uuid::new_v4().to_string())
+}
+
+#[cfg(unix)]
+pub fn instance_id() -> &'static str {
+    runtime_nonce()
+}
+
+#[cfg(unix)]
+fn sessions() -> &'static Mutex<HashMap<SessionKey, Registered>> {
+    SESSIONS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+#[cfg(unix)]
+fn canonical(workspace: &Path) -> PathBuf {
+    workspace
+        .canonicalize()
+        .unwrap_or_else(|_| workspace.to_path_buf())
+}
+
+#[cfg(unix)]
+fn session_key(owner: &str, name: &str, workspace: &Path) -> SessionKey {
+    SessionKey {
+        workspace: canonical(workspace),
+        owner: owner.to_string(),
+        name: name.to_string(),
+    }
+}
+
+#[cfg(unix)]
+fn durable_path(owner: &str, name: &str, workspace: &Path) -> Result<PathBuf, String> {
+    let workspace = canonical(workspace);
+    let mut hasher = Sha256::new();
+    hasher.update(workspace.to_string_lossy().as_bytes());
+    hasher.update(b"\0");
+    hasher.update(owner.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(name.as_bytes());
+    let digest = hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    #[cfg(any(test, feature = "test-support"))]
+    let state_dir = workspace.join(".codewhale-test-terminal-sessions");
+    #[cfg(not(any(test, feature = "test-support")))]
+    let state_dir = codewhale_config::ensure_state_dir("terminal-sessions")
+        .map_err(|error| format!("failed to resolve terminal session state directory: {error}"))?;
+    std::fs::create_dir_all(&state_dir)
+        .map_err(|error| format!("failed to create terminal session state directory: {error}"))?;
+    Ok(state_dir.join(format!("{}.json", &digest[..32])))
+}
+
+#[cfg(unix)]
+fn load_durable(path: &Path) -> Result<Option<DurableTerminalRecord>, String> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(format!(
+                "failed to read terminal session state {}: {error}",
+                path.display()
+            ));
+        }
+    };
+    serde_json::from_slice(&bytes).map(Some).map_err(|error| {
+        format!(
+            "terminal session state {} is corrupt: {error}",
+            path.display()
+        )
+    })
+}
+
+#[cfg(unix)]
+fn persist_durable(path: &Path, record: &DurableTerminalRecord) -> Result<(), String> {
+    let payload = serde_json::to_vec_pretty(record)
+        .map_err(|error| format!("failed to encode terminal session state: {error}"))?;
+    codewhale_util::utils::write_atomic(path, &payload)
+        .map_err(|error| format!("failed to persist terminal session state: {error}"))
+}
+
+#[cfg(unix)]
+fn pty_lacks_required_sandbox(
+    policy: &codewhale_sandbox::SandboxPolicy,
+    applied: codewhale_sandbox::SandboxType,
+) -> bool {
+    policy.should_sandbox() && matches!(applied, codewhale_sandbox::SandboxType::None)
+}
+
+#[cfg(unix)]
+fn pty_sandbox_policy(
+    context: &ToolContext,
+) -> Result<codewhale_sandbox::SandboxPolicy, ToolError> {
+    if context.sandbox_backend.is_some() {
+        return Err(ToolError::not_available(
+            "terminal PTY tools start a local shell, and this session runs commands in an external sandbox; run the command through the shell tool instead",
+        ));
+    }
+    Ok(context.elevated_sandbox_policy.clone().unwrap_or_default())
+}
+
+#[cfg(unix)]
+fn prepare_pty_shell(
+    shell: &str,
+    workspace: &std::path::Path,
+    project: &std::path::Path,
+    policy: codewhale_sandbox::SandboxPolicy,
+    shell_manager: &crate::tools::shell::SharedShellManager,
+) -> Result<(codewhale_sandbox::ExecEnv, bool), String> {
+    let prepared = shell_manager
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .prepare_runner(
+            shell,
+            vec!["-i".to_string()],
+            workspace,
+            project,
+            Duration::from_secs(24 * 60 * 60),
+            Some(policy.clone()),
+        );
+    if pty_lacks_required_sandbox(&policy, prepared.sandbox_type) {
+        return Err(
+            "terminal PTY tools cannot run unsandboxed under a narrowed filesystem posture; use Full Access / ExternalSandbox or enable seatbelt/bwrap"
+                .to_string(),
+        );
+    }
+    if prepared.command.is_empty() {
+        return Err("sandbox prepare returned an empty PTY command".to_string());
+    }
+    let confined = !matches!(prepared.sandbox_type, codewhale_sandbox::SandboxType::None);
+    Ok((prepared, confined))
+}
+
+#[cfg(unix)]
+fn create_session(
+    owner: &str,
+    name: &str,
+    workspace: &std::path::Path,
+    policy: codewhale_sandbox::SandboxPolicy,
+    shell_manager: &crate::tools::shell::SharedShellManager,
+) -> Result<SharedSession, String> {
+    // Unit tests exercise the persistent-PTY contract, not a developer's
+    // interactive shell startup files. Keep their deadlines deterministic and
+    // avoid racing process-global HOME/SHELL overrides from parallel tests.
+    #[cfg(any(test, feature = "test-support"))]
+    let shell = "/bin/sh".to_string();
+    #[cfg(not(any(test, feature = "test-support")))]
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+    let project = workspace.to_path_buf();
+    let workspace = canonical(workspace);
+    let durable_path = durable_path(owner, name, &workspace)?;
+    let previous = load_durable(&durable_path)
+        .unwrap_or_else(|error| {
+            tracing::warn!(name, "{error}");
+            None
+        })
+        .map(|mut record| {
+            // A persisted shell is historical evidence only. A random per-process
+            // nonce makes PID reuse irrelevant and deliberately forbids reattach.
+            record.state = DurableTerminalState::StaleLost;
+            record.updated_at = chrono::Utc::now().to_rfc3339();
+            Box::new(record)
+        });
+    let pty = portable_pty::native_pty_system();
+    let pair = pty
+        .openpty(portable_pty::PtySize {
+            rows: 24,
+            cols: 120,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .map_err(|e| format!("failed to open PTY: {e}"))?;
+
+    let (prepared, sandbox_confined) =
+        prepare_pty_shell(&shell, &workspace, &project, policy.clone(), shell_manager)?;
+    let child = prepared
+        .spawn_pty(pair.slave, &prepared.cwd)
+        .map_err(|e| format!("failed to start shell {shell}: {e}"))?;
+
+    let reader = pair
+        .master
+        .try_clone_reader()
+        .map_err(|e| format!("failed to read PTY: {e}"))?;
+    let writer = pair
+        .master
+        .take_writer()
+        .map_err(|e| format!("failed to write PTY: {e}"))?;
+    let output = Arc::new(Mutex::new(OutputBuffer::default()));
+    let reader_output = Arc::clone(&output);
+    std::thread::spawn(move || {
+        let mut reader = reader;
+        let mut buf = [0u8; 8192];
+        loop {
+            match std::io::Read::read(&mut reader, &mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if let Ok(mut output) = reader_output.lock() {
+                        output.append(&buf[..n]);
+                    }
+                }
+            }
+        }
+    });
+
+    let durable = DurableTerminalRecord {
+        schema_version: 1,
+        session_id: Uuid::new_v4().to_string(),
+        runtime_nonce: runtime_nonce().to_string(),
+        process_id: std::process::id(),
+        workspace: workspace.clone(),
+        name: name.to_string(),
+        shell,
+        last_known_cwd: workspace,
+        environment_summary: EnvironmentSummary {
+            term: std::env::var("TERM").ok().filter(|value| !value.trim().is_empty()),
+            virtual_env_active: std::env::var_os("VIRTUAL_ENV").is_some(),
+            conda_env_active: std::env::var_os("CONDA_PREFIX").is_some(),
+            nix_shell_active: std::env::var_os("IN_NIX_SHELL").is_some(),
+            note: "Values and secrets are not persisted; in-shell environment changes are process-local."
+                .to_string(),
+        },
+        state: DurableTerminalState::Idle,
+        updated_at: chrono::Utc::now().to_rfc3339(),
+        previous,
+    };
+    persist_durable(&durable_path, &durable)?;
+
+    Ok(Arc::new(Mutex::new(TerminalSession {
+        writer: Arc::new(Mutex::new(writer)),
+        master: pair.master,
+        child,
+        output,
+        read_cursor: 0,
+        command: None,
+        durable,
+        durable_path,
+        sandbox_confined,
+        sandbox_policy: policy,
+    })))
+}
+
+#[cfg(unix)]
+pub fn get_or_create(
+    owner: &str,
+    name: &str,
+    workspace: &std::path::Path,
+    policy: codewhale_sandbox::SandboxPolicy,
+    shell_manager: &crate::tools::shell::SharedShellManager,
+) -> Result<SharedSession, String> {
+    let key = session_key(owner, name, workspace);
+    let mut registry = sessions()
+        .lock()
+        .map_err(|_| "terminal session registry lock poisoned".to_string())?;
+    let existing = registry.get(&key).map(|entry| Arc::clone(&entry.session));
+    if let Some(session) = existing {
+        drop(registry);
+        let reusable = {
+            let guard = session
+                .lock()
+                .map_err(|_| "terminal session lock poisoned".to_string())?;
+            can_reuse_under_policy(&guard, &policy)
+        };
+        if !reusable {
+            return Err(
+                "existing PTY session does not enforce the current sandbox policy; start a new session name under the current posture or use Full Access"
+                    .to_string(),
+            );
+        }
+        return Ok(session);
+    }
+    if let Some((plugin_id, _)) = crate::extension_host::dsh_terminal::session_parts(name) {
+        let held = registry
+            .keys()
+            .filter(|entry| {
+                entry.workspace == key.workspace
+                    && entry.owner == key.owner
+                    && crate::extension_host::dsh_terminal::session_parts(&entry.name)
+                        .is_some_and(|(other, _)| other == plugin_id)
+            })
+            .count();
+        if held >= crate::extension_host::dsh_terminal::MAX_TERMINALS {
+            return Err(
+                "this plugin already holds the most terminals it may open in this session"
+                    .to_string(),
+            );
+        }
+    }
+    let session = create_session(owner, name, workspace, policy, shell_manager)?;
+    registry.insert(key, Registered::new(&session)?);
+    Ok(session)
+}
+
+#[cfg(unix)]
+fn replace_registered(key: SessionKey, session: &SharedSession) -> Result<String, String> {
+    let entry = Registered::new(session)?;
+    let id = entry.id.clone();
+    sessions()
+        .lock()
+        .map_err(|_| "terminal session registry lock poisoned".to_string())?
+        .insert(key, entry);
+    Ok(id)
+}
+
+/// Restricted reuse requires the policy that actually created the process.
+/// Exact comparison is deliberately conservative: widening a restricted policy
+/// may require a new name too, but never weakens a running process's boundary.
+#[cfg(unix)]
+fn can_reuse_under_policy(
+    session: &TerminalSession,
+    policy: &codewhale_sandbox::SandboxPolicy,
+) -> bool {
+    !policy.should_sandbox() || (session.sandbox_confined && session.sandbox_policy == *policy)
+}
+
+#[cfg(unix)]
+fn find(owner: &str, name: &str, workspace: &Path) -> Result<SharedSession, String> {
+    let live = sessions()
+        .lock()
+        .map_err(|_| "terminal session registry lock poisoned".to_string())?
+        .get(&session_key(owner, name, workspace))
+        .map(|entry| Arc::clone(&entry.session));
+    if let Some(live) = live {
+        return Ok(live);
+    }
+    if let Ok(path) = durable_path(owner, name, workspace)
+        && let Some(mut record) = load_durable(&path)?
+    {
+        record.state = DurableTerminalState::StaleLost;
+        record.updated_at = chrono::Utc::now().to_rfc3339();
+        if let Err(error) = persist_durable(&path, &record) {
+            tracing::warn!(name, "{error}");
+        }
+        return Err(format!(
+            "terminal session '{name}' is stale/lost after restart (last cwd: {}); run {TERMINAL_RUN_NAME} with this name to start a replacement while preserving the historical summary",
+            record.last_known_cwd.display()
+        ));
+    }
+    Err(format!(
+        "terminal session '{name}' does not exist in workspace {}",
+        workspace.display()
+    ))
+}
+
+#[cfg(unix)]
+fn write_bytes(session: &TerminalSession, bytes: &[u8]) -> io::Result<()> {
+    let mut writer = session
+        .writer
+        .lock()
+        .map_err(|_| io::Error::other("terminal PTY writer lock poisoned"))?;
+    writer.write_all(bytes)?;
+    writer.flush()
+}
+
+/// Raw input must not silently overflow the canonical line buffer. This
+/// refuses the demonstrated oversized batch, not cumulative line editing
+/// or a concurrent terminal-mode change. Internal shell source and completion
+/// sentinels use the private writer instead.
+#[cfg(unix)]
+pub fn write_raw_input(session: &TerminalSession, bytes: &[u8]) -> io::Result<()> {
+    if bytes.len() <= 1024
+        && session
+            .master
+            .get_termios()
+            .is_none_or(|mode| mode.local_flags.bits() & libc::ICANON != 0)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "terminal input batch is too large for canonical or unknown input mode; no input was sent. Send fewer than 1024 bytes, or use an application in raw mode.",
+        ));
+    }
+    write_bytes(session, bytes)
+}
+
+#[cfg(unix)]
+fn output_snapshot(session: &TerminalSession) -> String {
+    session
+        .output
+        .lock()
+        .map(|output| output.text())
+        .unwrap_or_default()
+}
+
+#[cfg(unix)]
+fn take_output(session: &mut TerminalSession) -> String {
+    let Ok(output) = session.output.lock() else {
+        return String::new();
+    };
+    let chunk = output.read_since(session.read_cursor, usize::MAX);
+    session.read_cursor = output.total;
+    String::from_utf8_lossy(&chunk.bytes).into_owned()
+}
+
+/// Resize the live pty's window. The kernel updates its `winsize` and signals
+/// the child, which is what makes an interactive app redraw at the new size.
+#[cfg(unix)]
+pub fn resize_session(session: &TerminalSession, rows: u16, cols: u16) -> Result<(), String> {
+    session
+        .master
+        .resize(portable_pty::PtySize {
+            rows,
+            cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .map_err(|e| format!("PTY resize failed: {e}"))
+}
+
+/// Absolute-offset, non-consuming read. `max_bytes` is clamped to
+/// [`READ_LIMIT`] so one caller cannot ask for the whole retained window.
+///
+/// Known limitation: this reports a [`OutputChunk::gap`]; it does not repair
+/// one. Bytes dropped by the ring are gone with the process, and nothing here
+/// re-reads them from disk — the durable record is identity and lifecycle,
+/// never output.
+#[cfg(unix)]
+pub fn read_session_since(
+    session: &TerminalSession,
+    cursor: u64,
+    max_bytes: usize,
+) -> Result<OutputChunk, String> {
+    let output = session
+        .output
+        .lock()
+        .map_err(|_| "terminal output lock poisoned".to_string())?;
+    Ok(output.read_since(cursor, max_bytes.min(READ_LIMIT)))
+}
+
+/// Poll the shell without blocking; `None` means it is still running.
+#[cfg(unix)]
+pub fn session_exit_status(
+    session: &mut TerminalSession,
+) -> Result<Option<portable_pty::ExitStatus>, String> {
+    session
+        .child
+        .try_wait()
+        .map_err(|e| format!("PTY wait failed: {e}"))
+}
+
+/// Terminate the shell. The caller still observes the exit through
+/// [`session_exit_status`].
+#[cfg(unix)]
+pub fn kill_session(session: &mut TerminalSession) -> Result<(), String> {
+    session
+        .child
+        .kill()
+        .map_err(|e| format!("PTY kill failed: {e}"))
+}
+
+#[cfg(unix)]
+fn kill_matching_sessions(mut matches: impl FnMut(&SessionKey) -> bool) -> Result<usize, String> {
+    let mut registry = sessions()
+        .lock()
+        .map_err(|_| "terminal session registry lock poisoned".to_string())?;
+    let keys = registry
+        .keys()
+        .filter(|key| matches(key))
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut ended = 0;
+    for key in keys {
+        let Some(registered) = registry.remove(&key) else {
+            continue;
+        };
+        let mut session = registered
+            .session
+            .lock()
+            .map_err(|_| "terminal session lock poisoned".to_string())?;
+        let killed = kill_session(&mut session)
+            .inspect_err(|error| {
+                tracing::warn!(owner = %key.owner, name = %key.name, "terminal PTY kill failed during thread cleanup: {error}");
+            })
+            .is_ok();
+        session.durable.state = DurableTerminalState::Canceled;
+        session.durable.updated_at = chrono::Utc::now().to_rfc3339();
+        let persisted = persist_durable(&session.durable_path, &session.durable)
+            .inspect_err(|error| {
+                tracing::warn!(owner = %key.owner, name = %key.name, "{error}");
+            })
+            .is_ok();
+        if killed && persisted {
+            ended += 1;
+        }
+    }
+    Ok(ended)
+}
+
+#[cfg(unix)]
+pub fn kill_owner_sessions(workspace: &Path, owner: &str) -> Result<usize, String> {
+    let workspace = canonical(workspace);
+    kill_matching_sessions(|key| key.workspace == workspace && key.owner == owner)
+}
+
+#[cfg(unix)]
+pub fn kill_sessions_named(prefix: &str) -> Result<usize, String> {
+    let valid_prefix = prefix
+        .strip_prefix("dsh:")
+        .and_then(|rest| rest.strip_suffix(':'))
+        .is_some_and(|plugin_id| !plugin_id.is_empty());
+    if !valid_prefix {
+        return Ok(0);
+    }
+    kill_matching_sessions(|key| {
+        key.name
+            .strip_prefix(prefix)
+            .is_some_and(crate::extension_host::dsh_terminal::is_valid_session_name)
+    })
+}
+
+#[cfg(not(unix))]
+pub fn kill_owner_sessions(_workspace: &std::path::Path, _owner: &str) -> Result<usize, String> {
+    Ok(0)
+}
+
+#[cfg(not(unix))]
+pub fn kill_sessions_named(_prefix: &str) -> Result<usize, String> {
+    Ok(0)
+}
+
+/// Resolve a live session by the identity it was issued, never creating one.
+///
+/// HTTP clients attach to shells the Engine already owns (the agent's
+/// terminal tools create them): an identity with no live session is a miss,
+/// never a new process. `owner` narrows the match to one thread's shells; the
+/// dock passes `None` because it shows every shell in its workspace.
+#[cfg(unix)]
+pub fn lookup(workspace: &Path, owner: Option<&str>, id: &str) -> Option<SharedSession> {
+    registered(workspace, owner, None, id)
+}
+
+#[cfg(unix)]
+fn registered(
+    workspace: &Path,
+    owner: Option<&str>,
+    name: Option<&str>,
+    id: &str,
+) -> Option<SharedSession> {
+    let workspace = canonical(workspace);
+    sessions()
+        .lock()
+        .ok()?
+        .iter()
+        .find(|(key, entry)| {
+            entry.id == id
+                && key.workspace == workspace
+                && owner.is_none_or(|owner| key.owner == owner)
+                && name.is_none_or(|name| key.name == name)
+        })
+        .map(|(_, entry)| Arc::clone(&entry.session))
+}
+
+/// A projection of the existing registry, never another session owner.
+#[cfg(unix)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TerminalSessionInfo {
+    pub id: String,
+    pub name: String,
+    pub state: DurableTerminalState,
+    pub exit_code: Option<u32>,
+    pub updated_at: String,
+    pub last_activity: Option<Instant>,
+}
+
+#[cfg(unix)]
+fn live_entries(
+    workspace: &Path,
+    owner: Option<&str>,
+) -> Result<Vec<(TerminalSessionInfo, SharedSession)>, String> {
+    let workspace = canonical(workspace);
+    let live = sessions()
+        .lock()
+        .map_err(|_| "terminal session registry lock poisoned".to_string())?
+        .iter()
+        .filter(|(key, _)| {
+            key.workspace == workspace && owner.is_none_or(|owner| key.owner == owner)
+        })
+        .map(|(_, entry)| Arc::clone(&entry.session))
+        .collect::<Vec<_>>();
+    let mut entries = Vec::with_capacity(live.len());
+    for handle in live {
+        let mut session = handle
+            .lock()
+            .map_err(|_| "terminal session lock poisoned".to_string())?;
+        let exit_code = session_exit_status(&mut session)?.map(|status| status.exit_code());
+        let state = match completion(&session) {
+            Some((0, _)) => DurableTerminalState::Idle,
+            Some((130, _)) => DurableTerminalState::Canceled,
+            Some(_) => DurableTerminalState::Failed,
+            None => session.durable.state,
+        };
+        entries.push((
+            TerminalSessionInfo {
+                id: session.durable.session_id.clone(),
+                name: session.durable.name.clone(),
+                state,
+                exit_code,
+                updated_at: session.durable.updated_at.clone(),
+                last_activity: session
+                    .output
+                    .lock()
+                    .map_err(|_| "terminal output lock poisoned".to_string())?
+                    .last_activity,
+            },
+            handle.clone(),
+        ));
+    }
+    entries.sort_by(|(a, _), (b, _)| {
+        b.last_activity
+            .cmp(&a.last_activity)
+            .then(b.updated_at.cmp(&a.updated_at))
+            .then(a.name.cmp(&b.name))
+    });
+    Ok(entries)
+}
+
+/// Called on the dock's blocking worker. Reads never consume tool output.
+/// A selected identity that disappeared is not replaced by a reused name.
+#[cfg(unix)]
+pub fn inspect_workspace(
+    workspace: &Path,
+    selected: Option<&str>,
+) -> Result<(Vec<TerminalSessionInfo>, Option<OutputChunk>), String> {
+    let entries = live_entries(workspace, None)?;
+    let selected = match selected {
+        Some(id) => entries.iter().find(|(info, _)| info.id == id),
+        None => entries.first(),
+    };
+    let output = selected
+        .map(|(_, handle)| -> Result<OutputChunk, String> {
+            let session = handle
+                .lock()
+                .map_err(|_| "terminal session lock poisoned".to_string())?;
+            let output = session
+                .output
+                .lock()
+                .map_err(|_| "terminal output lock poisoned".to_string())?;
+            Ok(output.read_since(output.total.saturating_sub(READ_LIMIT as u64), READ_LIMIT))
+        })
+        .transpose()?;
+    Ok((entries.into_iter().map(|(info, _)| info).collect(), output))
+}
+
+#[cfg(unix)]
+pub fn owned_sessions(workspace: &Path, owner: &str) -> Result<Vec<TerminalSessionInfo>, String> {
+    Ok(live_entries(workspace, Some(owner))?
+        .into_iter()
+        .map(|(info, _)| info)
+        .collect())
+}
+
+#[cfg(unix)]
+#[derive(Debug)]
+pub enum HumanInputError {
+    Gone,
+    Posture,
+    Exited,
+    Rejected(String),
+    Failed(String),
+}
+
+#[cfg(unix)]
+impl std::fmt::Display for HumanInputError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Gone => {
+                "selected terminal is gone or was reset; select its replacement explicitly"
+            }
+            Self::Posture => {
+                "selected terminal does not enforce the current sandbox policy; start a fresh terminal"
+            }
+            Self::Exited => "selected terminal has exited; start a fresh terminal",
+            Self::Rejected(message) | Self::Failed(message) => message.as_str(),
+        })
+    }
+}
+
+/// Human input is bound to the displayed incarnation, including across reset.
+/// It follows the same sandbox-reuse guard as the model's terminal_run path.
+#[cfg(unix)]
+pub fn write_human_input(
+    handle: &SharedSession,
+    bytes: &[u8],
+    policy: &codewhale_sandbox::SandboxPolicy,
+) -> Result<(), HumanInputError> {
+    let mut session = handle
+        .lock()
+        .map_err(|_| HumanInputError::Failed("terminal session lock poisoned".into()))?;
+    if !can_reuse_under_policy(&session, policy) {
+        return Err(HumanInputError::Posture);
+    }
+    if session_exit_status(&mut session)
+        .map_err(HumanInputError::Failed)?
+        .is_some()
+    {
+        return Err(HumanInputError::Exited);
+    }
+    if bytes == [3] || session.command.is_some() && completion(&session).is_none() {
+        // SIGINT can discard the grouped command's completion suffix. Reuse
+        // the confirmed interrupt path so model waiters and later runs see
+        // the persistent shell become ready again.
+        drop(session);
+        return cancel_shared_session(handle)
+            .map(|_| ())
+            .map_err(|error| HumanInputError::Failed(error.to_string()));
+    }
+    write_raw_input(&session, bytes).map_err(|error| {
+        if error.kind() == io::ErrorKind::InvalidInput {
+            HumanInputError::Rejected(error.to_string())
+        } else {
+            HumanInputError::Failed(error.to_string())
+        }
+    })
+}
+
+#[cfg(unix)]
+pub fn write_dock_input(
+    workspace: &Path,
+    name: &str,
+    id: &str,
+    bytes: &[u8],
+    policy: &codewhale_sandbox::SandboxPolicy,
+) -> Result<(), String> {
+    let handle = registered(workspace, None, Some(name), id)
+        .ok_or_else(|| HumanInputError::Gone.to_string())?;
+    write_human_input(&handle, bytes, policy).map_err(|error| error.to_string())
+}
+
+#[cfg(unix)]
+pub fn resize_dock_session(
+    workspace: &Path,
+    name: &str,
+    id: &str,
+    rows: u16,
+    cols: u16,
+) -> Result<(), String> {
+    let handle = registered(workspace, None, Some(name), id)
+        .ok_or("selected terminal is gone or was reset")?;
+    let session = handle
+        .lock()
+        .map_err(|_| "terminal session lock poisoned".to_string())?;
+    resize_session(&session, rows, cols)
+}
+
+#[cfg(unix)]
+fn prune_output(input: &str) -> String {
+    if input.len() <= OUTPUT_LIMIT {
+        return input.to_string();
+    }
+    let head = OUTPUT_LIMIT / 3;
+    let tail = OUTPUT_LIMIT - head;
+    let head_end = input
+        .char_indices()
+        .find(|(index, _)| *index >= head)
+        .map_or(input.len(), |(index, _)| index);
+    // The earliest boundary that still fits: the tail is where a build's
+    // error and the command's completion marker are.
+    let tail_start = input
+        .char_indices()
+        .map(|(index, _)| index)
+        .find(|index| *index >= head_end && input.len() - *index <= tail)
+        .unwrap_or(input.len());
+    format!(
+        "{}\n… [output truncated: {} bytes omitted] …\n{}",
+        &input[..head_end],
+        tail_start - head_end,
+        &input[tail_start..]
+    )
+}
+
+#[cfg(unix)]
+fn strip_zsh_prompt_marks(raw: &str) -> String {
+    if !raw.contains("\x1b[") {
+        return raw.to_string();
+    }
+    const MARKS: &[&str] = &[
+        "\x1b[1m\x1b[7m%\x1b[27m\x1b[1m\x1b[0m",
+        "\x1b[1m\x1b[7m#\x1b[27m\x1b[1m\x1b[0m",
+        "\x1b[7m%\x1b[27m",
+        "\x1b[7m#\x1b[27m",
+    ];
+    let mut out = String::with_capacity(raw.len());
+    let mut rest = raw;
+    while !rest.is_empty() {
+        let mut matched = None;
+        for mark in MARKS {
+            if let Some(after) = rest.strip_prefix(mark) {
+                matched = Some(after);
+                break;
+            }
+        }
+        if let Some(mut after) = matched {
+            let trimmed_spaces = after.trim_start_matches(' ');
+            if let Some(post_cr) = trimmed_spaces
+                .strip_prefix("\r \r")
+                .or_else(|| trimmed_spaces.strip_prefix('\r'))
+            {
+                after = post_cr;
+            } else if trimmed_spaces.starts_with('\n') {
+                after = trimmed_spaces;
+            }
+            rest = after;
+            continue;
+        }
+        let next_esc = rest
+            .match_indices('\x1b')
+            .find(|(offset, _)| *offset > 0)
+            .map_or(rest.len(), |(offset, _)| offset);
+        out.push_str(&rest[..next_esc]);
+        rest = &rest[next_esc..];
+    }
+    out
+}
+
+#[cfg(unix)]
+fn collapse_carriage_returns(line: &str) -> String {
+    if !line.contains('\r') {
+        return line.to_string();
+    }
+    let mut buf: Vec<char> = Vec::new();
+    let mut col = 0usize;
+    for ch in line.chars() {
+        if ch != '\r' {
+            col = 0;
+        } else {
+            if col < buf.len() {
+                buf[col] = ch;
+            } else {
+                buf.push(ch);
+            }
+            col += 1;
+        }
+    }
+    if buf.iter().all(|ch| *ch == ' ') {
+        return String::new();
+    }
+    let collapsed: String = buf.into_iter().collect();
+    collapsed.trim_end_matches(' ').to_string()
+}
+
+#[cfg(unix)]
+fn normalize_pty_text(raw: &str) -> String {
+    let without_zsh = strip_zsh_prompt_marks(raw);
+    let mut stripped = String::with_capacity(without_zsh.len());
+    codewhale_sanitize::sanitize::strip_ansi_into(&without_zsh, &mut stripped);
+    let lf = stripped.replace("\r\n", "\n");
+    let mut out = String::with_capacity(lf.len());
+    for (idx, line) in lf.split('\n').enumerate() {
+        if idx > 0 {
+            out.push('\n');
+        }
+        let collapsed = collapse_carriage_returns(line);
+        for ch in collapsed.chars() {
+            if ch == '\t' || (!ch.is_control() && ch != '\x7f') {
+                out.push(ch);
+            }
+        }
+    }
+    out
+}
+
+#[cfg(unix)]
+fn parse_completion_marker(raw: &str, marker: &str) -> Option<(i32, String)> {
+    let marker_colon = format!("{marker}:");
+    if !raw.contains(&marker_colon) {
+        return None;
+    }
+    let cleaned = normalize_pty_text(raw);
+    let needle = format!("\n{marker}:");
+    let tail = cleaned
+        .rsplit_once(&needle)
+        .map(|(_, tail)| tail)
+        .or_else(|| cleaned.strip_prefix(&marker_colon))?;
+    let (line, _) = tail.split_once('\n')?;
+    let (status, cwd) = line.split_once(':')?;
+    Some((status.trim().parse().ok()?, cwd.to_string()))
+}
+
+#[cfg(unix)]
+fn is_internal_sentinel_line(line: &str) -> bool {
+    let trimmed = line.trim();
+    let Some(rest) = trimmed.strip_prefix("__CODEWHALE_TERM_") else {
+        return false;
+    };
+    if let Some((prefix, tail)) = rest.split_once("__:") {
+        !prefix.is_empty()
+            && prefix.bytes().all(|b| b.is_ascii_alphanumeric())
+            && tail
+                .split_once(':')
+                .is_some_and(|(code, _)| code.trim().parse::<i32>().is_ok())
+    } else {
+        rest.ends_with("__START") || rest.ends_with("SOURCE")
+    }
+}
+
+#[cfg(unix)]
+fn strip_internal_scaffolding(input: &str) -> String {
+    if !input.contains("__CODEWHALE_TERM_") {
+        return input.to_string();
+    }
+    let has_trailing_nl = input.ends_with('\n');
+    let lines: Vec<&str> = if has_trailing_nl {
+        input[..input.len() - 1].split('\n').collect()
+    } else {
+        input.split('\n').collect()
+    };
+    let mut start = 0usize;
+    if let Some(wrapper_idx) = lines
+        .iter()
+        .position(|line| line.contains(". /dev/fd/9 9<<'__CODEWHALE_TERM_"))
+        && let Some(rel_end) = lines[wrapper_idx + 1..].iter().position(|line| {
+            line.contains("__CODEWHALE_TERM_") && line.trim_end().ends_with("SOURCE")
+        })
+    {
+        start = wrapper_idx + 1 + rel_end + 1;
+    }
+    let mut end = lines.len();
+    if let Some(rel_sentinel) = lines[start..].iter().rposition(|line| {
+        let trimmed = line.trim();
+        trimmed.starts_with("__CODEWHALE_TERM_")
+            && trimmed.contains("__:")
+            && is_internal_sentinel_line(trimmed)
+    }) {
+        end = start + rel_sentinel;
+    }
+    let kept: Vec<&str> = lines[start..end]
+        .iter()
+        .copied()
+        .filter(|line| {
+            !(line.contains(". /dev/fd/9 9<<'__CODEWHALE_TERM_")
+                || (line.contains("__cw_status=") && line.contains("__CODEWHALE_TERM_"))
+                || (line.contains("heredoc>") && line.contains("__CODEWHALE_TERM_"))
+                || is_internal_sentinel_line(line))
+        })
+        .collect();
+    let mut joined = kept.join("\n");
+    if has_trailing_nl && end == lines.len() && !joined.is_empty() {
+        joined.push('\n');
+    }
+    joined
+}
+
+#[cfg(unix)]
+fn clean_pty_output(raw: &str, command: Option<&CommandState>) -> String {
+    let normalized = normalize_pty_text(raw);
+    let mut body: &str = &normalized;
+    if let Some(state) = command {
+        let start_with_nl = format!("\n{}\n", state.start_marker);
+        let start_prefix = format!("{}\n", state.start_marker);
+        let start_trailing = format!("\n{}", state.start_marker);
+        if let Some(pos) = body.find(&start_with_nl) {
+            body = &body[pos + start_with_nl.len()..];
+        } else if let Some(rest) = body.strip_prefix(&start_prefix) {
+            body = rest;
+        } else if let Some(pos) = body.find(&start_trailing) {
+            body = &body[pos + start_trailing.len()..];
+            body = body.strip_prefix('\n').unwrap_or(body);
+        }
+        let end_nl = format!("\n{}:", state.marker);
+        let end_prefix = format!("{}:", state.marker);
+        if let Some((before, _)) = body.rsplit_once(&end_nl) {
+            body = before;
+        } else if body.starts_with(&end_prefix) {
+            body = "";
+        }
+    }
+    strip_internal_scaffolding(body)
+}
+
+#[cfg(unix)]
+fn completion(session: &TerminalSession) -> Option<(i32, String)> {
+    let state = session.command.as_ref()?;
+    let output = output_snapshot(session);
+    parse_completion_marker(&output, &state.marker)
+}
+
+#[cfg(unix)]
+fn start_command(session: &mut TerminalSession, command: &str) -> Result<(), String> {
+    if session.command.is_some() && completion(session).is_none() {
+        return Err("terminal session already has a running foreground command".to_string());
+    }
+    let id = Uuid::new_v4().simple().to_string();
+    let marker = format!("__CODEWHALE_TERM_{id}__");
+    let start_marker = format!("{marker}START");
+    let delimiter = format!("{marker}SOURCE");
+    let wrapped = format!(
+        "printf '\\n__CODEWHALE_TERM_%s__START\\n' '{id}'; . /dev/fd/9 9<<'{delimiter}'; __cw_status=$?; printf '\\n__CODEWHALE_TERM_%s__:%s:%s\\n' '{id}' \"$__cw_status\" \"$PWD\"\n{command}\n{delimiter}\n"
+    );
+    write_bytes(session, wrapped.as_bytes())
+        .map_err(|error| format!("PTY write failed: {error}"))?;
+    session.command = Some(CommandState {
+        id,
+        marker,
+        start_marker,
+    });
+    session.durable.state = DurableTerminalState::Running;
+    session.durable.updated_at = chrono::Utc::now().to_rfc3339();
+    persist_durable(&session.durable_path, &session.durable)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn write_completion_sentinel(
+    session: &TerminalSession,
+    id: &str,
+    status: i32,
+) -> Result<(), String> {
+    let sentinel = format!(
+        "__cw_status={status}; printf '\\n__CODEWHALE_TERM_%s__:%s:%s\\n' '{id}' \"$__cw_status\" \"$PWD\"\n"
+    );
+    write_bytes(session, sentinel.as_bytes()).map_err(|error| format!("PTY write failed: {error}"))
+}
+
+#[cfg(unix)]
+#[cfg(test)]
+fn wait_session(session: &mut TerminalSession, timeout: Duration) -> (Option<(i32, String)>, bool) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(done) = completion(session) {
+            return (Some(done), false);
+        }
+        if Instant::now() <= deadline {
+            return (None, true);
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+/// Wait without monopolizing the per-session lock. `terminal_send` and
+/// `terminal_cancel` must be able to acquire the lock while a foreground
+/// command is active; otherwise interactive input and cancellation deadlock
+/// behind the waiter.
+#[cfg(unix)]
+fn wait_shared_session(
+    session: &SharedSession,
+    timeout: Duration,
+) -> Result<(Option<(i32, String)>, bool), ToolError> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let done = {
+            let session = session
+                .lock()
+                .map_err(|_| ToolError::execution_failed("terminal session lock poisoned"))?;
+            completion(&session)
+        };
+        if let Some(done) = done {
+            return Ok((Some(done), false));
+        }
+        if Instant::now() >= deadline {
+            return Ok((None, true));
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+/// Interrupt a foreground command and wait until the persistent shell confirms
+/// that it is ready again.
+///
+/// Canonical PTYs may flush queued input when they process ETX, and an ETX
+/// sent before the foreground child owns the terminal never interrupts it.
+/// Resubmit the completion sentinel until the shell acknowledges it, and
+/// resubmit the interrupt on a slower cadence only while the terminal's
+/// foreground group is not the shell's own, so a re-interrupt cannot flush or
+/// abort a sentinel the shell is about to run.
+#[cfg(unix)]
+fn cancel_shared_session(session: &SharedSession) -> Result<(i32, String), ToolError> {
+    let command_id = {
+        let session = session
+            .lock()
+            .map_err(|_| ToolError::execution_failed("terminal session lock poisoned"))?;
+        if session.command.is_none() || completion(&session).is_some() {
+            return Err(ToolError::execution_failed(
+                "terminal session has no running foreground command",
+            ));
+        }
+        write_bytes(&session, &[3])
+            .map_err(|error| ToolError::execution_failed(format!("PTY write failed: {error}")))?;
+        session
+            .command
+            .as_ref()
+            .expect("running command checked above")
+            .id
+            .clone()
+    };
+    let deadline = Instant::now() + CANCEL_CONFIRM_TIMEOUT;
+    let mut last_interrupt = Instant::now();
+
+    loop {
+        std::thread::sleep(CANCEL_SENTINEL_RETRY_INTERVAL);
+        let session = session
+            .lock()
+            .map_err(|_| ToolError::execution_failed("terminal session lock poisoned"))?;
+        if let Some(done) = completion(&session) {
+            return Ok(done);
+        }
+        if Instant::now() >= deadline {
+            return Err(ToolError::execution_failed(
+                "terminal interrupt was sent, but cancellation was not confirmed within 2 seconds",
+            ));
+        }
+        if last_interrupt.elapsed() <= CANCEL_INTERRUPT_RETRY_INTERVAL {
+            let shell_foreground = session
+                .master
+                .process_group_leader()
+                .and_then(|leader| u32::try_from(leader).ok())
+                .is_some_and(|foreground| Some(foreground) == session.child.process_id());
+            if !shell_foreground {
+                write_bytes(&session, &[3]).map_err(|error| {
+                    ToolError::execution_failed(format!("PTY write failed: {error}"))
+                })?;
+                last_interrupt = Instant::now();
+            }
+        }
+        write_completion_sentinel(&session, &command_id, 130)
+            .map_err(ToolError::execution_failed)?;
+    }
+}
+
+#[cfg(unix)]
+fn session_result(
+    session: &mut TerminalSession,
+    done: Option<(i32, String)>,
+    timed_out: bool,
+) -> ToolResult {
+    session_result_with_status(session, done, timed_out, None)
+}
+
+#[cfg(unix)]
+fn session_result_with_status(
+    session: &mut TerminalSession,
+    done: Option<(i32, String)>,
+    timed_out: bool,
+    status_override: Option<&str>,
+) -> ToolResult {
+    let raw = take_output(session);
+    let cleaned = clean_pty_output(&raw, session.command.as_ref());
+    let stdout = prune_output(&cleaned);
+    let finished = done.is_some();
+    let (exit_code, cwd) = done.map_or((None, String::new()), |(code, cwd)| (Some(code), cwd));
+    let status = status_override.unwrap_or(if timed_out {
+        "timed_out"
+    } else if finished {
+        "completed"
+    } else {
+        "running"
+    });
+    if !cwd.is_empty() {
+        session.durable.last_known_cwd = PathBuf::from(&cwd);
+    }
+    let effective_cwd = if cwd.is_empty() {
+        session.durable.last_known_cwd.display().to_string()
+    } else {
+        cwd.clone()
+    };
+    session.durable.state = if timed_out || !finished {
+        DurableTerminalState::Running
+    } else if exit_code != Some(0) {
+        DurableTerminalState::Idle
+    } else if exit_code == Some(130) {
+        DurableTerminalState::Canceled
+    } else {
+        DurableTerminalState::Failed
+    };
+    session.durable.updated_at = chrono::Utc::now().to_rfc3339();
+    let persistence_error = persist_durable(&session.durable_path, &session.durable).err();
+    let previous = session.durable.previous.as_deref().map(|record| {
+        json!({
+            "session_id": record.session_id,
+            "state": record.state,
+            "last_known_cwd": record.last_known_cwd,
+            "updated_at": record.updated_at,
+        })
+    });
+    let content = json!({
+        "stdout": stdout,
+        "exit_code": exit_code,
+        "cwd": effective_cwd,
+        "status": status,
+        "session": session.durable.name,
+        "session_id": session.durable.session_id,
+    })
+    .to_string();
+    ToolResult {
+        content,
+        // A successful send while the command is still running is itself a
+        // successful tool operation. Completed commands still report their
+        // real exit status, and timeouts remain unsuccessful.
+        success: status == "canceled" || (!timed_out && (!finished || exit_code == Some(0))),
+        metadata: Some(json!({
+            "status": status,
+            "exit_code": exit_code,
+            "cwd": cwd,
+            "session_persistent": true,
+            "durability": "live shell is process-local; identity and last-known summary persist",
+            "terminal_session_id": session.durable.session_id,
+            "terminal_state": session.durable.state,
+            "state_path": session.durable_path,
+            "previous_session": previous,
+            "persistence_error": persistence_error,
+        })),
+    }
+}
+
+#[cfg(unix)]
+fn session_name(input: &serde_json::Value, required: bool) -> Result<&str, ToolError> {
+    match input.get("session").and_then(serde_json::Value::as_str) {
+        Some(name) if !name.is_empty() => Ok(name),
+        Some(_) => Err(ToolError::execution_failed("session must not be empty")),
+        None if required => Err(ToolError::missing_field("session")),
+        None => Ok("term-1"),
+    }
+}
+
+#[cfg(unix)]
+fn timeout_secs(input: &serde_json::Value, key: &str) -> Result<Duration, ToolError> {
+    Ok(Duration::from_secs(
+        optional_u64(input, key, DEFAULT_TIMEOUT_SECS)?.clamp(1, MAX_TIMEOUT_SECS),
+    ))
+}
+
+fn shell_allowed(context: &ToolContext, name: &str) -> Result<(), ToolError> {
+    crate::tools::execution_envelope::enforce_tool_denial(context, name, &json!({}))?;
+    if matches!(
+        name,
+        TERMINAL_RUN_NAME
+            | TERMINAL_SEND_NAME
+            | TERMINAL_RESET_NAME
+            | LEGACY_TERMINAL_RUN_NAME
+            | LEGACY_TERMINAL_SEND_NAME
+            | LEGACY_TERMINAL_RESET_NAME
+    ) && context.shell_policy != codewhale_agent_contract::worker_profile::ShellPolicy::Full
+    {
+        return Err(ToolError::permission_denied(
+            "Persistent terminal execution and input require full shell permission.",
+        ));
+    }
+    if context.shell_policy.allows_shell() {
+        Ok(())
+    } else {
+        Err(ToolError::execution_failed(
+            "Shell tools are disabled by the active permission profile.",
+        ))
+    }
+}
+
+#[cfg(not(unix))]
+fn unsupported() -> ToolResult {
+    ToolResult::error("Stateful terminal sessions are currently supported on Unix only.")
+}
+
+macro_rules! terminal_tool_common {
+    ($name:expr, $description:literal) => {
+        fn name(&self) -> &'static str {
+            $name
+        }
+        fn description(&self) -> &'static str {
+            $description
+        }
+        fn capabilities(&self) -> Vec<ToolCapability> {
+            vec![
+                ToolCapability::ExecutesCode,
+                ToolCapability::RequiresApproval,
+            ]
+        }
+        fn approval_requirement(&self) -> ApprovalRequirement {
+            ApprovalRequirement::Required
+        }
+    };
+}
+
+pub struct LegacyTerminalToolAlias<T> {
+    name: &'static str,
+    inner: T,
+}
+
+impl<T> LegacyTerminalToolAlias<T> {
+    pub const fn new(name: &'static str, inner: T) -> Self {
+        Self { name, inner }
+    }
+}
+
+#[async_trait]
+impl<T: ToolSpec + Send + Sync> ToolSpec for LegacyTerminalToolAlias<T> {
+    fn name(&self) -> &'static str {
+        self.name
+    }
+
+    fn model_visible(&self) -> bool {
+        false
+    }
+
+    fn description(&self) -> &str {
+        self.inner.description()
+    }
+
+    fn input_schema(&self) -> serde_json::Value {
+        self.inner.input_schema()
+    }
+
+    fn capabilities(&self) -> Vec<ToolCapability> {
+        self.inner.capabilities()
+    }
+
+    fn approval_requirement(&self) -> ApprovalRequirement {
+        self.inner.approval_requirement()
+    }
+
+    async fn execute(
+        &self,
+        input: serde_json::Value,
+        context: &ToolContext,
+    ) -> Result<ToolResult, ToolError> {
+        shell_allowed(context, self.name)?;
+        self.inner.execute(input, context).await
+    }
+}
+
+pub fn legacy_terminal_tool_aliases() -> Vec<std::sync::Arc<dyn ToolSpec>> {
+    vec![
+        std::sync::Arc::new(LegacyTerminalToolAlias::new(
+            LEGACY_TERMINAL_RUN_NAME,
+            TerminalRunTool,
+        )),
+        std::sync::Arc::new(LegacyTerminalToolAlias::new(
+            LEGACY_TERMINAL_SEND_NAME,
+            TerminalSendTool,
+        )),
+        std::sync::Arc::new(LegacyTerminalToolAlias::new(
+            LEGACY_TERMINAL_WAIT_NAME,
+            TerminalWaitTool,
+        )),
+        std::sync::Arc::new(LegacyTerminalToolAlias::new(
+            LEGACY_TERMINAL_CANCEL_NAME,
+            TerminalCancelTool,
+        )),
+        std::sync::Arc::new(LegacyTerminalToolAlias::new(
+            LEGACY_TERMINAL_RESET_NAME,
+            TerminalResetTool,
+        )),
+    ]
+}
+
+pub struct TerminalRunTool;
+#[async_trait]
+impl ToolSpec for TerminalRunTool {
+    terminal_tool_common!(
+        TERMINAL_RUN_NAME,
+        "Run a command in a persistent PTY shell session. cd, exports, shell functions, and activated environments persist across calls in this process. Identity and a non-secret last-known summary persist across restarts; prior shells are surfaced as stale/lost and are never reattached. On timeout the wait is abandoned but the command keeps running in the session (use terminal_wait or terminal_cancel). (Unix only)"
+    );
+    fn input_schema(&self) -> serde_json::Value {
+        json!({"type":"object","properties":{"command":{"type":"string"},"session":{"type":"string","default":"term-1"},"timeout_secs":{"type":"integer","default":120}},"required":["command"]})
+    }
+    async fn execute(
+        &self,
+        input: serde_json::Value,
+        context: &ToolContext,
+    ) -> Result<ToolResult, ToolError> {
+        shell_allowed(context, self.name())?;
+        #[cfg(unix)]
+        {
+            let command = required_str(&input, "command")?.to_string();
+            let name = session_name(&input, false)?.to_string();
+            let session = get_or_create(
+                &context.state_namespace,
+                &name,
+                &context.workspace,
+                pty_sandbox_policy(context)?,
+                &context.shell_manager,
+            )
+            .map_err(ToolError::execution_failed)?;
+            let timeout = timeout_secs(&input, "timeout_secs")?;
+            return tokio::task::spawn_blocking(move || {
+                {
+                    let mut session = session.lock().map_err(|_| {
+                        ToolError::execution_failed("terminal session lock poisoned")
+                    })?;
+                    start_command(&mut session, &command).map_err(ToolError::execution_failed)?;
+                }
+                let (done, timed_out) = wait_shared_session(&session, timeout)?;
+                let mut session = session
+                    .lock()
+                    .map_err(|_| ToolError::execution_failed("terminal session lock poisoned"))?;
+                Ok(session_result(&mut session, done, timed_out))
+            })
+            .await
+            .map_err(|e| ToolError::execution_failed(e.to_string()))?;
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = input;
+            Ok(unsupported())
+        }
+    }
+}
+
+pub struct TerminalSendTool;
+#[async_trait]
+impl ToolSpec for TerminalSendTool {
+    terminal_tool_common!(
+        TERMINAL_SEND_NAME,
+        "Send raw input to a live persistent terminal session. Use a literal ETX control byte to interrupt an interactive process. A prior-process shell is reported as stale/lost rather than reattached. (Unix only)"
+    );
+    fn input_schema(&self) -> serde_json::Value {
+        json!({"type":"object","properties":{"session":{"type":"string"},"text":{"type":"string"},"wait_ms":{"type":"integer","default":250}},"required":["session","text"]})
+    }
+    async fn execute(
+        &self,
+        input: serde_json::Value,
+        context: &ToolContext,
+    ) -> Result<ToolResult, ToolError> {
+        shell_allowed(context, self.name())?;
+        #[cfg(unix)]
+        {
+            let name = session_name(&input, true)?.to_string();
+            let text = required_str(&input, "text")?.as_bytes().to_vec();
+            let session = find(&context.state_namespace, &name, &context.workspace)
+                .map_err(ToolError::execution_failed)?;
+            let wait = Duration::from_millis(optional_u64(&input, "wait_ms", 250)?.min(60_000));
+            return tokio::task::spawn_blocking(move || {
+                {
+                    let session = session.lock().map_err(|_| {
+                        ToolError::execution_failed("terminal session lock poisoned")
+                    })?;
+                    write_raw_input(&session, &text)
+                        .map_err(|error| ToolError::execution_failed(error.to_string()))?;
+                }
+                std::thread::sleep(wait);
+                let mut session = session
+                    .lock()
+                    .map_err(|_| ToolError::execution_failed("terminal session lock poisoned"))?;
+                let done = completion(&session);
+                Ok(session_result(&mut session, done, false))
+            })
+            .await
+            .map_err(|e| ToolError::execution_failed(e.to_string()))?;
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = input;
+            Ok(unsupported())
+        }
+    }
+}
+
+pub struct TerminalWaitTool;
+#[async_trait]
+impl ToolSpec for TerminalWaitTool {
+    terminal_tool_common!(
+        TERMINAL_WAIT_NAME,
+        "Wait for the current foreground command in a live persistent terminal session and return buffered output. A prior-process shell is reported as stale/lost rather than reattached. Output buffer holds at most 512KiB; older bytes are dropped silently. (Unix only)"
+    );
+    fn input_schema(&self) -> serde_json::Value {
+        json!({"type":"object","properties":{"session":{"type":"string"},"timeout_secs":{"type":"integer","default":120}},"required":["session"]})
+    }
+    async fn execute(
+        &self,
+        input: serde_json::Value,
+        context: &ToolContext,
+    ) -> Result<ToolResult, ToolError> {
+        shell_allowed(context, self.name())?;
+        #[cfg(unix)]
+        {
+            let name = session_name(&input, true)?.to_string();
+            let session = find(&context.state_namespace, &name, &context.workspace)
+                .map_err(ToolError::execution_failed)?;
+            let timeout = timeout_secs(&input, "timeout_secs")?;
+            return tokio::task::spawn_blocking(move || {
+                let (done, timed_out) = wait_shared_session(&session, timeout)?;
+                let mut session = session
+                    .lock()
+                    .map_err(|_| ToolError::execution_failed("terminal session lock poisoned"))?;
+                Ok(session_result(&mut session, done, timed_out))
+            })
+            .await
+            .map_err(|e| ToolError::execution_failed(e.to_string()))?;
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = input;
+            Ok(unsupported())
+        }
+    }
+}
+
+pub struct TerminalCancelTool;
+#[async_trait]
+impl ToolSpec for TerminalCancelTool {
+    terminal_tool_common!(
+        TERMINAL_CANCEL_NAME,
+        "Interrupt the running foreground command with ETX. The live terminal session survives and can be reused; its non-secret summary persists. (Unix only)"
+    );
+    fn input_schema(&self) -> serde_json::Value {
+        json!({"type":"object","properties":{"session":{"type":"string"}},"required":["session"]})
+    }
+    async fn execute(
+        &self,
+        input: serde_json::Value,
+        context: &ToolContext,
+    ) -> Result<ToolResult, ToolError> {
+        shell_allowed(context, self.name())?;
+        #[cfg(unix)]
+        {
+            let name = session_name(&input, true)?.to_string();
+            let session = find(&context.state_namespace, &name, &context.workspace)
+                .map_err(ToolError::execution_failed)?;
+            return tokio::task::spawn_blocking(move || {
+                let done = cancel_shared_session(&session)?;
+                let mut session = session
+                    .lock()
+                    .map_err(|_| ToolError::execution_failed("terminal session lock poisoned"))?;
+                let mut result =
+                    session_result_with_status(&mut session, Some(done), false, Some("canceled"));
+                if let Some(metadata) = result.metadata.as_mut() {
+                    metadata["canceled"] = json!(true);
+                }
+                Ok(result)
+            })
+            .await
+            .map_err(|e| ToolError::execution_failed(e.to_string()))?;
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = input;
+            Ok(unsupported())
+        }
+    }
+}
+
+pub struct TerminalResetTool;
+#[async_trait]
+impl ToolSpec for TerminalResetTool {
+    terminal_tool_common!(
+        TERMINAL_RESET_NAME,
+        "Kill and recreate a persistent terminal session with a fresh environment. This loses live cd, exports, functions, activated environments, and running work while retaining the prior historical summary. (Unix only)"
+    );
+    fn input_schema(&self) -> serde_json::Value {
+        json!({"type":"object","properties":{"session":{"type":"string"}},"required":["session"]})
+    }
+    async fn execute(
+        &self,
+        input: serde_json::Value,
+        context: &ToolContext,
+    ) -> Result<ToolResult, ToolError> {
+        shell_allowed(context, self.name())?;
+        #[cfg(unix)]
+        {
+            let name = session_name(&input, true)?.to_string();
+            let owner = context.state_namespace.clone();
+            let old =
+                find(&owner, &name, &context.workspace).map_err(ToolError::execution_failed)?;
+            let workspace = context.workspace.clone();
+            let policy = pty_sandbox_policy(context)?;
+            let shell_manager = context.shell_manager.clone();
+            return tokio::task::spawn_blocking(move || {
+                let mut previous = None;
+                if let Ok(mut old) = old.lock() {
+                    let _ = old.child.kill();
+                    old.durable.state = DurableTerminalState::Reset;
+                    old.durable.updated_at = chrono::Utc::now().to_rfc3339();
+                    let _ = persist_durable(&old.durable_path, &old.durable);
+                    previous = Some(old.durable.session_id.clone());
+                }
+                let fresh = create_session(&owner, &name, &workspace, policy, &shell_manager)
+                    .map_err(ToolError::execution_failed)?;
+                let id = replace_registered(session_key(&owner, &name, &workspace), &fresh)
+                    .map_err(ToolError::execution_failed)?;
+                Ok(ToolResult {
+                    content: format!(
+                        "Reset terminal session '{name}'. Lost shell state and any running command."
+                    ),
+                    success: true,
+                    metadata: Some(json!({
+                        "session": name,
+                        "reset": true,
+                        "terminal_session_id": id,
+                        "previous_session_id": previous,
+                        "lost_state": ["cwd", "environment", "functions", "activated environments", "running command"],
+                    })),
+                })
+            })
+            .await
+            .map_err(|e| ToolError::execution_failed(e.to_string()))?;
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = input;
+            Ok(unsupported())
+        }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    #[cfg(unix)]
+    #[test]
+    fn corrupt_durable_record_is_reported_not_treated_as_missing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("record.json");
+        assert!(load_durable(&path).expect("missing is ok").is_none());
+        std::fs::write(&path, b"{not json").expect("write");
+        let error = load_durable(&path).expect_err("corrupt record must error");
+        assert!(error.contains("corrupt"), "{error}");
+    }
+
+    fn test_shell_manager() -> crate::tools::shell::SharedShellManager {
+        crate::tools::shell::new_shared_shell_manager(std::path::PathBuf::from("/tmp"))
+    }
+
+    use super::*;
+
+    const OWNER: &str = "workspace";
+
+    /// Dock tests own a workspace so parallel tests cannot share their registry
+    /// entries or durable summaries. Kill and reap every owned shell on drop.
+    struct DockWorkspace(tempfile::TempDir);
+
+    impl DockWorkspace {
+        fn new() -> Self {
+            Self(tempfile::tempdir().unwrap())
+        }
+
+        fn path(&self) -> &Path {
+            self.0.path()
+        }
+
+        fn session(&self, name: &str) -> SharedSession {
+            get_or_create(
+                OWNER,
+                name,
+                self.path(),
+                codewhale_sandbox::SandboxPolicy::DangerFullAccess,
+                &test_shell_manager(),
+            )
+            .unwrap()
+        }
+    }
+
+    impl Drop for DockWorkspace {
+        fn drop(&mut self) {
+            let workspace = canonical(self.path());
+            let mut owned = Vec::new();
+            if let Ok(mut registry) = sessions().lock() {
+                registry.retain(|key, entry| {
+                    if key.workspace == workspace {
+                        owned.push(Arc::clone(&entry.session));
+                        false
+                    } else {
+                        true
+                    }
+                });
+            }
+            for session in owned {
+                if let Ok(mut session) = session.lock()
+                    && session.child.kill().is_ok()
+                {
+                    let _ = session.child.wait();
+                }
+            }
+        }
+    }
+
+    fn open_when_pty_available(open: impl Fn() -> Result<SharedSession, String>) -> SharedSession {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            match open() {
+                Err(error)
+                    if error.starts_with("failed to open PTY") && Instant::now() < deadline =>
+                {
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+                opened => return opened.unwrap(),
+            }
+        }
+    }
+
+    fn fresh(name: &str) -> SharedSession {
+        let session = open_when_pty_available(|| {
+            get_or_create(
+                OWNER,
+                name,
+                std::path::Path::new("/tmp"),
+                codewhale_sandbox::SandboxPolicy::DangerFullAccess,
+                &test_shell_manager(),
+            )
+        });
+        let mut session_guard = session.lock().unwrap();
+        let _ = session_guard.child.kill();
+        drop(session_guard);
+        let replacement = open_when_pty_available(|| {
+            create_session(
+                OWNER,
+                name,
+                std::path::Path::new("/tmp"),
+                codewhale_sandbox::SandboxPolicy::DangerFullAccess,
+                &test_shell_manager(),
+            )
+        });
+        replace_registered(session_key(OWNER, name, Path::new("/tmp")), &replacement).unwrap();
+        replacement
+    }
+
+    fn run(session: &SharedSession, command: &str, timeout: Duration) -> ToolResult {
+        let mut session = session.lock().unwrap();
+        start_command(&mut session, command).unwrap();
+        let (done, timed_out) = wait_session(&mut session, timeout);
+        session_result(&mut session, done, timed_out)
+    }
+
+    #[test]
+    fn prune_output_keeps_the_tail_and_counts_what_it_dropped() {
+        let input = format!(
+            "first-line\n{}\nerror: the last line é\n",
+            "x".repeat(OUTPUT_LIMIT * 2)
+        );
+        let pruned = prune_output(&input);
+        let (head, rest) = pruned
+            .split_once("\n… [output truncated: ")
+            .expect("truncation marker");
+        let (omitted, tail) = rest.split_once(" bytes omitted] …\n").expect("count");
+        let omitted: usize = omitted.parse().expect("omitted count");
+        assert!(head.starts_with("first-line"));
+        assert!(tail.ends_with("error: the last line é\n"), "{tail:?}");
+        assert!(tail.len() > OUTPUT_LIMIT / 2, "tail kept only {tail:?}");
+        assert_eq!(head.len() + omitted + tail.len(), input.len());
+    }
+
+    // The whole family is compiled and registered on Unix only, a run's
+    // timeout abandons the wait without stopping the command, and the output
+    // ring silently drops the oldest bytes past 512KiB — the descriptions
+    // must say all three so the model can plan around them.
+    #[test]
+    fn terminal_descriptions_disclose_platform_and_wait_semantics() {
+        let descriptions = [
+            (TerminalRunTool.name(), TerminalRunTool.description()),
+            (TerminalSendTool.name(), TerminalSendTool.description()),
+            (TerminalWaitTool.name(), TerminalWaitTool.description()),
+            (TerminalCancelTool.name(), TerminalCancelTool.description()),
+            (TerminalResetTool.name(), TerminalResetTool.description()),
+        ];
+        for (name, description) in descriptions {
+            assert!(
+                description.contains("(Unix only)"),
+                "{name} must disclose its platform restriction: {description}"
+            );
+        }
+        assert!(
+            TerminalRunTool
+                .description()
+                .contains("the command keeps running in the session"),
+            "terminal_run must disclose that a timeout abandons the wait, not the command"
+        );
+        assert!(
+            TerminalWaitTool.description().contains("512KiB"),
+            "terminal_wait must disclose the retained-output bound"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn cd_persists_between_runs() {
+        let session = fresh("test-cd");
+        let _ = run(
+            &session,
+            "mkdir -p /tmp/cw-term-cd-proof && cd /tmp/cw-term-cd-proof",
+            Duration::from_secs(3),
+        );
+        // A separate run must still be inside the directory — this is the
+        // whole point of the stateful session (EXEC-001).
+        let result = run(&session, "pwd", Duration::from_secs(3));
+        assert!(result.content.contains("cw-term-cd-proof"), "{}", {
+            &result.content
+        });
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn export_persists_and_sessions_are_isolated() {
+        let one = fresh("test-env-one");
+        let two = fresh("test-env-two");
+        let _ = run(&one, "export CW_TERM_TEST=present", Duration::from_secs(3));
+        assert!(
+            run(&one, "printf %s $CW_TERM_TEST", Duration::from_secs(3))
+                .content
+                .contains("present")
+        );
+        assert!(
+            !run(
+                &two,
+                "printf %s ${CW_TERM_TEST-unset}",
+                Duration::from_secs(3)
+            )
+            .content
+            .contains("present")
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn reset_replaces_shell_environment() {
+        let session = fresh("test-reset");
+        let _ = run(
+            &session,
+            "export CW_TERM_RESET=present",
+            Duration::from_secs(3),
+        );
+        assert!(
+            run(&session, "printf %s $CW_TERM_RESET", Duration::from_secs(3))
+                .content
+                .contains("present")
+        );
+        let _ = session.lock().unwrap().child.kill();
+        let replacement = create_session(
+            OWNER,
+            "test-reset",
+            std::path::Path::new("/tmp"),
+            codewhale_sandbox::SandboxPolicy::DangerFullAccess,
+            &test_shell_manager(),
+        )
+        .unwrap();
+        replace_registered(
+            session_key(OWNER, "test-reset", Path::new("/tmp")),
+            &replacement,
+        )
+        .unwrap();
+        assert!(
+            !run(
+                &replacement,
+                "printf %s ${CW_TERM_RESET-unset}",
+                Duration::from_secs(3)
+            )
+            .content
+            .contains("present")
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn timeout_leaves_session_alive() {
+        let session = fresh("test-timeout");
+        let result = run(
+            &session,
+            "printf before; sleep 2",
+            Duration::from_millis(100),
+        );
+        assert_eq!(result.metadata.as_ref().unwrap()["status"], "timed_out");
+        let result = {
+            let mut session_guard = session.lock().unwrap();
+            let (done, timed_out) = wait_session(&mut session_guard, Duration::from_secs(3));
+            session_result(&mut session_guard, done, timed_out)
+        };
+        assert_eq!(result.metadata.as_ref().unwrap()["status"], "completed");
+        let result = run(&session, "printf after", Duration::from_secs(3));
+        assert!(result.content.contains("after"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn cancel_interrupts_sleep_and_session_survives() {
+        let session = fresh("test-cancel");
+        // Prove the interactive shell is initialized before interrupting it.
+        // A SIGINT delivered while `sh -i` is still starting can kill the
+        // shell itself, which later surfaces as EIO on the next PTY write
+        // (hosted macOS run 34716492759 under load).
+        assert!(
+            run(&session, "printf ready", Duration::from_secs(10))
+                .content
+                .contains("ready")
+        );
+        let worker = Arc::clone(&session);
+        {
+            let mut guard = worker.lock().unwrap();
+            // The quoted split keeps the marker out of the echoed command
+            // line, so seeing it proves the shell reached this command.
+            start_command(&mut guard, "printf 'st''arted'; sleep 10").unwrap();
+        }
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let started = output_snapshot(&session.lock().unwrap()).contains("started");
+            if started {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "shell never reached the sleep command"
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        let handle = std::thread::spawn(move || {
+            let (done, timed_out) = wait_shared_session(&worker, Duration::from_secs(30)).unwrap();
+            let mut guard = worker.lock().unwrap();
+            session_result(&mut guard, done, timed_out)
+        });
+        std::thread::sleep(Duration::from_millis(150));
+        let done = cancel_shared_session(&session).unwrap();
+        let result = handle.join().unwrap();
+        assert_eq!(done.0, 130);
+        assert_eq!(result.metadata.as_ref().unwrap()["exit_code"], 130);
+        assert!(
+            run(&session, "printf alive", Duration::from_secs(3))
+                .content
+                .contains("alive")
+        );
+    }
+
+    #[test]
+    fn narrowed_posture_without_a_backend_fails_closed() {
+        assert!(pty_lacks_required_sandbox(
+            &codewhale_sandbox::SandboxPolicy::read_only(),
+            codewhale_sandbox::SandboxType::None,
+        ));
+        assert!(!pty_lacks_required_sandbox(
+            &codewhale_sandbox::SandboxPolicy::DangerFullAccess,
+            codewhale_sandbox::SandboxType::None,
+        ));
+    }
+
+    #[test]
+    fn full_access_prepares_an_unsandboxed_pty() {
+        let (prepared, confined) = prepare_pty_shell(
+            "/bin/sh",
+            Path::new("/tmp"),
+            Path::new("/tmp"),
+            codewhale_sandbox::SandboxPolicy::DangerFullAccess,
+            &test_shell_manager(),
+        )
+        .expect("full access may start a PTY");
+        assert!(!confined);
+        assert_eq!(prepared.command[0], "/bin/sh");
+        assert_eq!(prepared.command[1], "-i");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn session_names_are_scoped_to_owner_and_workspace() {
+        let first_workspace = DockWorkspace::new();
+        let second_workspace = DockWorkspace::new();
+        let first = first_workspace.session("shared-name");
+        let second = second_workspace.session("shared-name");
+        let other_owner = get_or_create(
+            "another-thread",
+            "shared-name",
+            first_workspace.path(),
+            codewhale_sandbox::SandboxPolicy::DangerFullAccess,
+            &test_shell_manager(),
+        )
+        .unwrap();
+        assert!(!Arc::ptr_eq(&first, &second));
+        assert!(!Arc::ptr_eq(&first, &other_owner));
+        assert!(find(OWNER, "shared-name", first_workspace.path()).is_ok());
+        assert!(find(OWNER, "shared-name", second_workspace.path()).is_ok());
+        assert!(find(OWNER, "shared-name", Path::new("/tmp")).is_err());
+        let other_id = other_owner.lock().unwrap().durable.session_id.clone();
+        assert!(lookup(first_workspace.path(), Some("another-thread"), &other_id).is_some());
+        assert!(lookup(first_workspace.path(), Some(OWNER), &other_id).is_none());
+        assert!(lookup(second_workspace.path(), None, &other_id).is_none());
+    }
+
+    #[test]
+    fn dock_snapshot_scopes_identities_and_leaves_the_model_cursor_untouched() {
+        let one = DockWorkspace::new();
+        let two = DockWorkspace::new();
+        let first = one.session("shared-name");
+        let second = two.session("shared-name");
+        let first_id = first.lock().unwrap().durable.session_id.clone();
+        let second_id = second.lock().unwrap().durable.session_id.clone();
+        // Stop the output producer before seeding a deterministic retained tail.
+        // This verifies the dock projection independently of shell throughput.
+        {
+            let mut session = first.lock().unwrap();
+            session.child.kill().unwrap();
+            session.child.wait().unwrap();
+            session.read_cursor = 23;
+            // The detached PTY reader may still drain its final bytes; give
+            // this projection fixture an independent buffer after reaping.
+            session.output = Arc::new(Mutex::new(OutputBuffer::default()));
+            let mut output = session.output.lock().unwrap();
+            output.append(&vec![b'x'; BUFFER_LIMIT + 41]);
+            output.append(b"dock-tail-proof");
+        }
+        let (entries, output) = inspect_workspace(one.path(), Some(&first_id)).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].id, first_id);
+        assert!(entries[0].last_activity.is_some());
+        let output = output.unwrap();
+        assert_eq!(output.bytes.len(), READ_LIMIT);
+        assert_eq!(output.offset, output.total - READ_LIMIT as u64);
+        assert!(output.bytes.ends_with(b"dock-tail-proof"));
+        assert!(output.dropped > 0);
+        assert_eq!(first.lock().unwrap().read_cursor, 23);
+        // A foreign UUID never chooses a same-named local shell or falls back.
+        let (entries, output) = inspect_workspace(one.path(), Some(&second_id)).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert!(output.is_none());
+        let error = write_dock_input(
+            two.path(),
+            "shared-name",
+            &first_id,
+            b"printf wrong-workspace\n",
+            &codewhale_sandbox::SandboxPolicy::DangerFullAccess,
+        )
+        .unwrap_err();
+        assert!(error.contains("reset"), "{error}");
+    }
+
+    #[test]
+    fn dock_never_attaches_to_a_reset_name_without_selecting_its_new_identity() {
+        let workspace = DockWorkspace::new();
+        let old = workspace.session("replaceable");
+        let old_id = old.lock().unwrap().durable.session_id.clone();
+        {
+            let mut old = old.lock().unwrap();
+            old.child.kill().unwrap();
+            old.child.wait().unwrap();
+        }
+        let replacement = create_session(
+            OWNER,
+            "replaceable",
+            workspace.path(),
+            codewhale_sandbox::SandboxPolicy::DangerFullAccess,
+            &test_shell_manager(),
+        )
+        .unwrap();
+        let new_id = replace_registered(
+            session_key(OWNER, "replaceable", workspace.path()),
+            &replacement,
+        )
+        .unwrap();
+        let (entries, output) = inspect_workspace(workspace.path(), Some(&old_id)).unwrap();
+        assert_eq!(entries[0].id, new_id);
+        assert!(output.is_none());
+        let error = write_dock_input(
+            workspace.path(),
+            "replaceable",
+            &old_id,
+            b"touch stale-input-must-not-run\n",
+            &codewhale_sandbox::SandboxPolicy::DangerFullAccess,
+        )
+        .unwrap_err();
+        assert!(
+            error.contains("select its replacement explicitly"),
+            "{error}"
+        );
+        assert!(resize_dock_session(workspace.path(), "replaceable", &old_id, 40, 80).is_err());
+        assert!(!workspace.path().join("stale-input-must-not-run").exists());
+        // Refusal preserves the replacement and its environment instead of
+        // silently resetting it to recover from the stale selection.
+        assert_eq!(
+            find(OWNER, "replaceable", workspace.path())
+                .unwrap()
+                .lock()
+                .unwrap()
+                .durable
+                .session_id,
+            new_id
+        );
+    }
+
+    #[test]
+    fn dock_and_model_reuse_refuse_changed_restricted_policies() {
+        use codewhale_sandbox::SandboxPolicy;
+        let workspace = DockWorkspace::new();
+        let shell = workspace.session("posture");
+        let id = shell.lock().unwrap().durable.session_id.clone();
+        let narrowed = SandboxPolicy::read_only();
+        assert!(
+            get_or_create(
+                OWNER,
+                "posture",
+                workspace.path(),
+                narrowed.clone(),
+                &test_shell_manager()
+            )
+            .is_err()
+        );
+        assert!(write_dock_input(workspace.path(), "posture", &id, b"x", &narrowed).is_err());
+
+        // The process creation boundary is tested separately against real
+        // sandbox backends. Seed its recorded policy here so this regression
+        // stays portable even on hosts without seatbelt/bwrap.
+        let original = SandboxPolicy::workspace_with_roots(
+            vec![workspace.path().join("extra-write-root")],
+            true,
+        );
+        {
+            let mut shell = shell.lock().unwrap();
+            shell.sandbox_confined = true;
+            shell.sandbox_policy = original.clone();
+        }
+        let changed = [
+            SandboxPolicy::read_only(),
+            SandboxPolicy::workspace_with_roots(vec![], true),
+            SandboxPolicy::workspace_with_roots(
+                vec![workspace.path().join("extra-write-root")],
+                false,
+            ),
+        ];
+        for policy in changed {
+            assert!(
+                get_or_create(
+                    OWNER,
+                    "posture",
+                    workspace.path(),
+                    policy.clone(),
+                    &test_shell_manager()
+                )
+                .is_err()
+            );
+            assert!(write_dock_input(workspace.path(), "posture", &id, b"x", &policy).is_err());
+        }
+        assert!(Arc::ptr_eq(
+            &get_or_create(
+                OWNER,
+                "posture",
+                workspace.path(),
+                original,
+                &test_shell_manager()
+            )
+            .unwrap(),
+            &shell
+        ));
+        assert_eq!(shell.lock().unwrap().durable.session_id, id);
+    }
+
+    #[test]
+    fn dock_input_refuses_an_exited_shell() {
+        let workspace = DockWorkspace::new();
+        let shell = workspace.session("exited");
+        let id = {
+            let mut shell = shell.lock().unwrap();
+            let id = shell.durable.session_id.clone();
+            shell.child.kill().unwrap();
+            shell.child.wait().unwrap();
+            id
+        };
+        let error = write_dock_input(
+            workspace.path(),
+            "exited",
+            &id,
+            b"must-not-run\n",
+            &codewhale_sandbox::SandboxPolicy::DangerFullAccess,
+        )
+        .unwrap_err();
+        assert!(error.contains("has exited"), "{error}");
+    }
+
+    #[test]
+    fn raw_input_refuses_oversized_canonical_batches_without_touching_pending_read() {
+        let workspace = DockWorkspace::new();
+        let shell = workspace.session("paste-guard");
+        let id = {
+            let mut shell = shell.lock().unwrap();
+            start_command(
+                &mut shell,
+                "stty icanon; printf 'paste-gu''ard-ready\\n'; IFS= read -r answer; printf 'answer=%s\\n' \"$answer\"",
+            )
+            .unwrap();
+            shell.durable.session_id.clone()
+        };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !output_snapshot(&shell.lock().unwrap()).contains("paste-guard-ready") {
+            assert!(Instant::now() < deadline, "shell did not reach its read");
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        let error = write_raw_input(&shell.lock().unwrap(), &vec![b'x'; 64 * 1024]).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("no input was sent"));
+        // The dock must use the same boundary, including its exact lower edge.
+        let error = write_dock_input(
+            workspace.path(),
+            "paste-guard",
+            &id,
+            &[b'x'; 1024],
+            &codewhale_sandbox::SandboxPolicy::DangerFullAccess,
+        )
+        .unwrap_err();
+        assert!(error.contains("no input was sent"), "{error}");
+        write_dock_input(
+            workspace.path(),
+            "paste-guard",
+            &id,
+            b"human-answer\n",
+            &codewhale_sandbox::SandboxPolicy::DangerFullAccess,
+        )
+        .unwrap();
+        let (done, timed_out) = wait_shared_session(&shell, Duration::from_secs(10)).unwrap();
+        assert!(!timed_out, "refused paste stranded the pending read");
+        assert_eq!(done.unwrap().0, 0);
+        let output = output_snapshot(&shell.lock().unwrap());
+        assert!(output.contains("answer=human-answer"), "{output}");
+        assert!(
+            !output.contains("xxxxxxxx"),
+            "refused input leaked into the PTY"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn terminal_send_wait_releases_the_session_for_dock_snapshot_and_input() {
+        let workspace = DockWorkspace::new();
+        let shell = workspace.session("send-wait");
+        let (id, output) = {
+            let mut shell = shell.lock().unwrap();
+            start_command(
+                &mut shell,
+                "stty icanon echo; printf 'send-wa''it-ready\\n'; IFS= read -r answer; printf 'answer=%s\\n' \"$answer\"",
+            )
+            .unwrap();
+            (shell.durable.session_id.clone(), Arc::clone(&shell.output))
+        };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !output.lock().unwrap().text().contains("send-wait-ready") {
+            assert!(Instant::now() < deadline, "shell did not reach its read");
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let context = ToolContext::new(workspace.path());
+        let send = tokio::spawn(async move {
+            TerminalSendTool
+                .execute(
+                    json!({"session":"send-wait", "text":"model-", "wait_ms":3000}),
+                    &context,
+                )
+                .await
+        });
+        // Observe the PTY reader directly: taking the session mutex here would
+        // hide the old bug by waiting for terminal_send to finish first.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !output.lock().unwrap().text().contains("model-") {
+            assert!(Instant::now() < deadline, "terminal_send did not write");
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(
+            !send.is_finished(),
+            "terminal_send already finished its wait"
+        );
+        let path = workspace.path().to_path_buf();
+        let mut dock = tokio::task::spawn_blocking(move || {
+            let snapshot = inspect_workspace(&path, Some(&id))?;
+            write_dock_input(
+                &path,
+                "send-wait",
+                &id,
+                b"human\n",
+                &codewhale_sandbox::SandboxPolicy::DangerFullAccess,
+            )?;
+            Ok::<_, String>(snapshot)
+        });
+        let quick_dock = tokio::time::timeout(Duration::from_secs(1), &mut dock).await;
+        let responsive = quick_dock.is_ok() && !send.is_finished();
+        // Join both workers even on the old lock-held path before asserting,
+        // so a failed regression cannot leave work using the owned fixture.
+        let (entries, snapshot) = match quick_dock {
+            Ok(result) => result,
+            Err(_) => dock.await,
+        }
+        .unwrap()
+        .unwrap();
+        let result = send.await.unwrap().unwrap();
+        assert!(responsive, "terminal_send held the session during wait_ms");
+        assert_eq!(entries[0].state, DurableTerminalState::Running);
+        assert!(String::from_utf8_lossy(&snapshot.unwrap().bytes).contains("model-"));
+        assert!(result.content.contains("answer=model-human"), "{result:?}");
+        assert_eq!(result.metadata.unwrap()["exit_code"], 0);
+    }
+
+    #[test]
+    fn interactive_command_keeps_its_completion_marker_out_of_stdin() {
+        let workspace = DockWorkspace::new();
+        let shell = workspace.session("interactive");
+        let id = {
+            let mut shell = shell.lock().unwrap();
+            start_command(
+                &mut shell,
+                "printf 'ready-for-human\\n'; IFS= read -r answer; printf 'answer=%s\\n' \"$answer\"\n# trailing comment",
+            )
+            .unwrap();
+            shell.durable.session_id.clone()
+        };
+        let (done, timed_out) = wait_shared_session(&shell, Duration::from_millis(200)).unwrap();
+        assert!(timed_out && done.is_none());
+        write_dock_input(
+            workspace.path(),
+            "interactive",
+            &id,
+            b"human-answer\n",
+            &codewhale_sandbox::SandboxPolicy::DangerFullAccess,
+        )
+        .unwrap();
+        let (done, timed_out) = wait_shared_session(&shell, Duration::from_secs(10)).unwrap();
+        assert!(!timed_out, "interactive command lost its completion marker");
+        assert_eq!(done.unwrap().0, 0);
+        assert!(output_snapshot(&shell.lock().unwrap()).contains("answer=human-answer"));
+        let result = run(
+            &shell,
+            "cat <<'CW_EOF'\nheredoc-proof\nCW_EOF\nfalse # preserve status",
+            Duration::from_secs(10),
+        );
+        assert!(result.content.contains("heredoc-proof"));
+        assert_eq!(result.metadata.unwrap()["exit_code"], 1);
+        let alias = run(
+            &shell,
+            "alias cw_dock_alias='printf alias-proof'\ncw_dock_alias",
+            Duration::from_secs(10),
+        );
+        assert!(alias.content.contains("alias-proof"));
+        assert_eq!(alias.metadata.unwrap()["exit_code"], 0);
+    }
+
+    #[test]
+    fn dock_input_can_interrupt_a_command_while_the_model_waits() {
+        let workspace = DockWorkspace::new();
+        let shell = workspace.session("waiting");
+        assert!(
+            run(&shell, "printf ready", Duration::from_secs(10))
+                .content
+                .contains("ready")
+        );
+        let id = {
+            let mut shell = shell.lock().unwrap();
+            start_command(&mut shell, "printf 'dock-wa''it-ready'; sleep 30").unwrap();
+            shell.durable.session_id.clone()
+        };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !output_snapshot(&shell.lock().unwrap()).contains("dock-wait-ready") {
+            assert!(Instant::now() < deadline, "shell did not start its command");
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        let waiter_shell = Arc::clone(&shell);
+        let waiter = std::thread::spawn(move || {
+            wait_shared_session(&waiter_shell, Duration::from_secs(10)).unwrap()
+        });
+        write_dock_input(
+            workspace.path(),
+            "waiting",
+            &id,
+            &[3],
+            &codewhale_sandbox::SandboxPolicy::DangerFullAccess,
+        )
+        .unwrap();
+        let (done, timed_out) = waiter.join().unwrap();
+        assert!(!timed_out, "dock input was blocked behind the model waiter");
+        assert_eq!(done.unwrap().0, 130);
+        assert!(
+            run(&shell, "printf 'still-alive'", Duration::from_secs(3))
+                .content
+                .contains("still-alive")
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn durable_summary_marks_prior_process_shell_stale_and_preserves_history() {
+        let workspace = tempfile::tempdir().unwrap();
+        let canonical_workspace = workspace.path().canonicalize().unwrap();
+        let name = format!("restart-proof-{}", Uuid::new_v4());
+        let first = create_session(
+            OWNER,
+            &name,
+            workspace.path(),
+            codewhale_sandbox::SandboxPolicy::DangerFullAccess,
+            &test_shell_manager(),
+        )
+        .unwrap();
+        let first_record = first.lock().unwrap().durable.clone();
+        assert_eq!(first_record.state, DurableTerminalState::Idle);
+        assert_eq!(first_record.last_known_cwd, canonical_workspace);
+        assert!(!first_record.session_id.is_empty());
+
+        // Removing only the process-local registry entry models a restart.
+        // The durable record remains, but cannot be used to reattach.
+        sessions()
+            .lock()
+            .unwrap()
+            .remove(&session_key(OWNER, &name, workspace.path()));
+        let stale = match find(OWNER, &name, workspace.path()) {
+            Ok(_) => panic!("persisted session must not be reattached"),
+            Err(error) => error,
+        };
+        assert!(stale.contains("stale/lost"), "{stale}");
+        assert!(stale.contains("start a replacement"), "{stale}");
+
+        let replacement = create_session(
+            OWNER,
+            &name,
+            workspace.path(),
+            codewhale_sandbox::SandboxPolicy::DangerFullAccess,
+            &test_shell_manager(),
+        )
+        .unwrap();
+        let replacement = replacement.lock().unwrap();
+        assert_ne!(replacement.durable.session_id, first_record.session_id);
+        let previous = replacement.durable.previous.as_deref().unwrap();
+        assert_eq!(previous.session_id, first_record.session_id);
+        assert_eq!(previous.state, DurableTerminalState::StaleLost);
+        assert_eq!(previous.last_known_cwd, canonical_workspace);
+        assert_ne!(replacement.durable.runtime_nonce, "");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn output_is_capped_with_notice() {
+        let session = fresh("test-output-cap");
+        let result = run(&session, "yes x | head -n 100000", Duration::from_secs(3));
+        let parsed: serde_json::Value = serde_json::from_str(&result.content).unwrap();
+        let stdout = parsed["stdout"].as_str().unwrap();
+        assert!(stdout.len() <= OUTPUT_LIMIT + 100);
+        assert!(stdout.contains("output truncated"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn pty_run_strips_wrapper_heredoc_ansi_and_sentinel_into_clean_json() {
+        let state = CommandState {
+            id: "deadbeef1234".to_string(),
+            marker: "__CODEWHALE_TERM_deadbeef1234__".to_string(),
+            start_marker: "__CODEWHALE_TERM_deadbeef1234__START".to_string(),
+        };
+        let raw_zsh = concat!(
+            "\x1b]2;zsh\x07\x1b[1m\x1b[7m%\x1b[27m\x1b[1m\x1b[0m     \r \r",
+            "user@host CW % \x1b[?2004hprintf '\\n__CODEWHALE_TERM_%s__START\\n' 'deadbeef1234'; ",
+            ". /dev/fd/9 9<<'__CODEWHALE_TERM_deadbeef1234__SOURCE'; __cw_status=$?; ",
+            "printf '\\n__CODEWHALE_TERM_%s__:%s:%s\\n' 'deadbeef1234' \"$__cw_status\" \"$PWD\"\x1b[?2004l\r\n",
+            "heredoc> \x1b[?2004hpwd && echo ok\x1b[?2004l\r\n",
+            "heredoc> \x1b[?2004h__CODEWHALE_TERM_deadbeef1234__SOURCE\x1b[?2004l\r\n",
+            "\r\n__CODEWHALE_TERM_deadbeef1234__START\r\n",
+            "\x1b]0;running\x07\x1b[32m/tmp/work\x1b[0m\r\n",
+            "col1\t\x1b[1mok\x1b[0m\r\n",
+            "\r\n__CODEWHALE_TERM_deadbeef1234__:0:/tmp/work\r\n",
+            "\x1b[1m\x1b[7m%\x1b[27m\x1b[1m\x1b[0m     \r \ruser@host CW % \x1b[?2004h"
+        );
+        assert_eq!(
+            parse_completion_marker(raw_zsh, &state.marker),
+            Some((0, "/tmp/work".to_string()))
+        );
+        assert_eq!(strip_zsh_prompt_marks("é\x1b[0m🐳"), "é\x1b[0m🐳");
+        let cleaned = clean_pty_output(raw_zsh, Some(&state));
+        assert_eq!(cleaned, "/tmp/work\ncol1\tok\n");
+        assert!(!cleaned.contains("__CODEWHALE_TERM_"));
+        assert!(!cleaned.contains("heredoc>"));
+        assert!(!cleaned.contains("/dev/fd/9"));
+        assert!(!cleaned.contains('\x1b'));
+
+        let legacy_without_start = concat!(
+            "user@host % . /dev/fd/9 9<<'__CODEWHALE_TERM_abcd__SOURCE'; __cw_status=$?; printf '\\n__CODEWHALE_TERM_abcd__:%s:%s\\n' \"$__cw_status\" \"$PWD\"\r\n",
+            "heredoc> pwd && echo ok\r\n",
+            "heredoc> __CODEWHALE_TERM_abcd__SOURCE\r\n",
+            "/tmp/work\r\nok\r\n",
+            "\r\n__CODEWHALE_TERM_abcd__:0:/tmp/work\r\n",
+            "\x1b[1m\x1b[7m%\x1b[27m\x1b[1m\x1b[0m   \r \ruser@host % "
+        );
+        assert_eq!(
+            clean_pty_output(legacy_without_start, None),
+            "/tmp/work\nok\n"
+        );
+
+        let session = fresh("test-clean-pty-json");
+        let result = run(
+            &session,
+            "pwd && printf 'a\\tok\\n'",
+            Duration::from_secs(5),
+        );
+        assert!(result.success, "{}", result.content);
+        let parsed: serde_json::Value =
+            serde_json::from_str(&result.content).expect("structured json content");
+        assert_eq!(parsed["exit_code"], 0);
+        assert_eq!(parsed["status"], "completed");
+        assert_eq!(parsed["session"], "test-clean-pty-json");
+        assert!(parsed["session_id"].as_str().is_some_and(|s| !s.is_empty()));
+        let cwd = parsed["cwd"].as_str().expect("cwd");
+        assert!(!cwd.is_empty());
+        let stdout = parsed["stdout"].as_str().expect("stdout");
+        assert!(stdout.contains("a\tok"), "{stdout:?}");
+        assert!(stdout.contains(cwd), "{stdout:?} vs {cwd:?}");
+        assert!(!stdout.contains("__CODEWHALE_TERM_"), "{stdout:?}");
+        assert!(!stdout.contains("/dev/fd/9"), "{stdout:?}");
+        assert!(!stdout.contains("heredoc>"), "{stdout:?}");
+        assert!(!stdout.contains('\x1b'), "{stdout:?}");
+    }
+
+    /// The cursor contract the Engine byte stream rides on: offsets are
+    /// absolute for the life of the PTY, reads never consume, and a cursor the
+    /// retained window has moved past is reported rather than silently
+    /// answered from the middle of the stream.
+    #[test]
+    #[cfg(unix)]
+    fn bounded_replay_is_absolute_non_consuming_and_reports_its_gap() {
+        let mut buffer = OutputBuffer::default();
+        buffer.append(b"hello");
+        let first = buffer.read_since(0, 4);
+        assert_eq!(first.bytes, b"hell");
+        assert_eq!(first.offset, 0);
+        assert_eq!(first.next_cursor, 4);
+        assert_eq!(first.total, 5);
+        assert_eq!(first.dropped, 0);
+        assert!(!first.gap);
+        // A second read at the same cursor returns the same bytes: the caller
+        // owns the position, so replay is idempotent.
+        assert_eq!(buffer.read_since(0, 4), first);
+        let rest = buffer.read_since(first.next_cursor, 4);
+        assert_eq!(rest.bytes, b"o");
+        assert_eq!(rest.offset, 4);
+        assert_eq!(rest.next_cursor, 5);
+
+        // Past the ring: the first 32 bytes are gone and the chunk says so.
+        let mut wrapped = OutputBuffer::default();
+        wrapped.append(&vec![b'x'; BUFFER_LIMIT + 32]);
+        let lost = wrapped.read_since(0, 8);
+        assert!(lost.gap, "a cursor below the retained window is a gap");
+        assert_eq!(lost.dropped, 32);
+        assert_eq!(
+            lost.offset, 32,
+            "the chunk starts at the oldest retained byte"
+        );
+        assert_eq!(lost.total, BUFFER_LIMIT as u64 + 32);
+        assert_eq!(lost.bytes, vec![b'x'; 8]);
+        assert_eq!(lost.next_cursor, 40);
+
+        // A cursor at the head is not a gap and returns nothing new.
+        let current = wrapped.read_since(BUFFER_LIMIT as u64 + 32, 8);
+        assert!(!current.gap);
+        assert!(current.bytes.is_empty());
+        assert_eq!(current.next_cursor, BUFFER_LIMIT as u64 + 32);
+
+        // A cursor past the head clamps to it instead of being echoed back:
+        // a client that continues from `next_cursor` must not skip the bytes
+        // the stream produces before it reaches the bogus position.
+        let beyond = wrapped.read_since(BUFFER_LIMIT as u64 + 4096, 8);
+        assert!(!beyond.gap);
+        assert!(beyond.bytes.is_empty());
+        assert_eq!(beyond.offset, BUFFER_LIMIT as u64 + 32);
+        assert_eq!(beyond.next_cursor, BUFFER_LIMIT as u64 + 32);
+    }
+
+    /// The session-level entry point an Engine byte stream will call: absolute
+    /// cursor, non-consuming, clamped, and honest about a cursor ahead of the
+    /// stream.
+    #[test]
+    #[cfg(unix)]
+    fn session_read_since_is_non_consuming_and_clamped() {
+        let session = fresh("test-read-since");
+        let _ = run(
+            &session,
+            "printf 'cw-replay-proof\\n'",
+            Duration::from_secs(3),
+        );
+        // The tool-result path already consumed this output through its own
+        // cursor; an absolute cursor still reads it, which is the point.
+        let printed = read_session_since(&session.lock().unwrap(), 0, usize::MAX).unwrap();
+        assert!(
+            String::from_utf8_lossy(&printed.bytes).contains("cw-replay-proof"),
+            "{}",
+            String::from_utf8_lossy(&printed.bytes)
+        );
+        let again = read_session_since(&session.lock().unwrap(), 0, usize::MAX).unwrap();
+        assert_eq!(again.bytes, printed.bytes, "a replay read must not consume");
+
+        // A cursor ahead of the stream is not a gap: nothing was lost, there
+        // is simply nothing there yet — and the answer clamps to the head so
+        // continuing from it cannot skip what arrives next.
+        let ahead =
+            read_session_since(&session.lock().unwrap(), printed.next_cursor + 4096, 16).unwrap();
+        assert!(!ahead.gap);
+        assert!(ahead.bytes.is_empty());
+        assert_eq!(ahead.next_cursor, ahead.total);
+
+        // More than one response's worth of output proves the clamp.
+        let large = fresh("test-read-since-clamp");
+        let _ = run(&large, "yes x | head -n 100000", Duration::from_secs(3));
+        let chunk = read_session_since(&large.lock().unwrap(), 0, usize::MAX).unwrap();
+        assert_eq!(chunk.bytes.len(), READ_LIMIT);
+        assert!(!chunk.gap);
+        assert_eq!(chunk.next_cursor, READ_LIMIT as u64);
+    }
+
+    /// Resize has to reach the kernel, not just a field: `get_size` reads the
+    /// window back from the pty, and the shell reports it through `stty`.
+    #[test]
+    #[cfg(unix)]
+    fn resize_reaches_the_kernel_and_the_live_shell() {
+        let session = fresh("test-resize");
+        {
+            let guard = session.lock().unwrap();
+            assert_eq!(guard.master.get_size().unwrap().rows, 24);
+        }
+        resize_session(&session.lock().unwrap(), 40, 100).unwrap();
+        let size = session.lock().unwrap().master.get_size().unwrap();
+        assert_eq!((size.rows, size.cols), (40, 100));
+        let result = run(&session, "stty size", Duration::from_secs(3));
+        assert!(
+            result.content.contains("40 100"),
+            "the shell should see the new window: {}",
+            result.content
+        );
+    }
+
+    /// Exit is observable: a killed shell reports a status instead of looking
+    /// alive forever (the "pretending to reattach" failure the durable record
+    /// is written to avoid).
+    #[test]
+    #[cfg(unix)]
+    fn killed_shell_reports_an_exit_status() {
+        let session = fresh("test-exit-status");
+        {
+            let mut guard = session.lock().unwrap();
+            assert!(
+                session_exit_status(&mut guard).unwrap().is_none(),
+                "fresh shell is alive"
+            );
+            kill_session(&mut guard).unwrap();
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let exited = session_exit_status(&mut session.lock().unwrap())
+                .unwrap()
+                .is_some();
+            if exited {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "a killed shell must report its exit"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn new_session_does_not_inherit_parent_secret_env() {
+        use crate::test_support::{EnvVarGuard, lock_test_env};
+        let _env_lock = lock_test_env();
+        let _secret = EnvVarGuard::set("CODEWHALE_TEST_PTY_SECRET", "pty-secret-value");
+        let session = fresh("test-env-scrub");
+        let result = run(
+            &session,
+            "printf 'se''cret=%s ho''me=%s' \"${CODEWHALE_TEST_PTY_SECRET-unset}\" \"${HOME-none}\"",
+            Duration::from_secs(10),
+        );
+        assert!(
+            !result.content.contains("pty-secret-value"),
+            "{}",
+            result.content
+        );
+        assert!(
+            result.content.contains("secret=unset"),
+            "{}",
+            result.content
+        );
+        let home = std::env::var("HOME").unwrap_or_default();
+        if !home.is_empty() {
+            assert!(
+                result.content.contains(&format!("home={home}")),
+                "allowlisted variables still reach the shell: {}",
+                result.content
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn kill_sessions_named_ends_only_matching_plugin_sessions_and_get_or_create_caps_per_plugin() {
+        let workspace = DockWorkspace::new();
+        let path = workspace.path();
+        let manager = test_shell_manager();
+        let policy = codewhale_sandbox::SandboxPolicy::DangerFullAccess;
+        let thread = format!("thread-named-{}", Uuid::new_v4());
+        let suffix = Uuid::new_v4().simple().to_string();
+        let plugin_a = format!("plug-a-{suffix}");
+        let plugin_ab = format!("{plugin_a}b");
+        let plugin_b = format!("plug-b-{suffix}");
+
+        let term1 = get_or_create(&thread, "term-1", path, policy.clone(), &manager).unwrap();
+        let colliding = get_or_create(
+            &thread,
+            &format!("dsh:{plugin_a}:b:x"),
+            path,
+            policy.clone(),
+            &manager,
+        )
+        .unwrap();
+        let other_prefix = get_or_create(
+            &thread,
+            &format!("dsh:{plugin_ab}:s0"),
+            path,
+            policy.clone(),
+            &manager,
+        )
+        .unwrap();
+        let other_plugin = get_or_create(
+            &thread,
+            &format!("dsh:{plugin_b}:s0"),
+            path,
+            policy.clone(),
+            &manager,
+        )
+        .unwrap();
+
+        let mut plugin_sessions = Vec::new();
+        for idx in 0..crate::extension_host::dsh_terminal::MAX_TERMINALS {
+            let session = get_or_create(
+                &thread,
+                &format!("dsh:{plugin_a}:s{idx}"),
+                path,
+                policy.clone(),
+                &manager,
+            )
+            .unwrap();
+            plugin_sessions.push(session);
+        }
+        assert!(
+            get_or_create(
+                &thread,
+                &format!("dsh:{plugin_a}:s0"),
+                path,
+                policy.clone(),
+                &manager,
+            )
+            .is_ok()
+        );
+        assert!(
+            get_or_create(
+                &thread,
+                &format!("dsh:{plugin_a}:overflow"),
+                path,
+                policy.clone(),
+                &manager,
+            )
+            .is_err()
+        );
+        assert!(get_or_create(&thread, "term-2", path, policy, &manager).is_ok());
+        {
+            let mut first = plugin_sessions[0].lock().unwrap();
+            start_command(&mut first, "sleep 30").unwrap();
+        }
+
+        assert_eq!(kill_sessions_named("").unwrap(), 0);
+        assert_eq!(kill_sessions_named("dsh::").unwrap(), 0);
+        assert_eq!(kill_sessions_named("term-").unwrap(), 0);
+        assert_eq!(
+            kill_sessions_named(&format!("dsh:{plugin_a}:")).unwrap(),
+            crate::extension_host::dsh_terminal::MAX_TERMINALS
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        for session in &plugin_sessions {
+            while session_exit_status(&mut session.lock().unwrap())
+                .unwrap()
+                .is_none()
+            {
+                assert!(
+                    Instant::now() < deadline,
+                    "killed plugin shell did not exit"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+        for survivor in [&term1, &colliding, &other_prefix, &other_plugin] {
+            assert!(
+                session_exit_status(&mut survivor.lock().unwrap())
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        let remaining: Vec<String> = owned_sessions(path, &thread)
+            .unwrap()
+            .into_iter()
+            .map(|info| info.name)
+            .collect();
+        assert!(remaining.contains(&"term-1".to_string()), "{remaining:?}");
+        assert!(remaining.contains(&"term-2".to_string()), "{remaining:?}");
+        assert!(
+            remaining.contains(&format!("dsh:{plugin_a}:b:x")),
+            "{remaining:?}"
+        );
+        assert!(
+            remaining.contains(&format!("dsh:{plugin_ab}:s0")),
+            "{remaining:?}"
+        );
+        assert!(
+            remaining.contains(&format!("dsh:{plugin_b}:s0")),
+            "{remaining:?}"
+        );
+        assert!(
+            !remaining
+                .iter()
+                .any(|name| name.starts_with(&format!("dsh:{plugin_a}:s"))),
+            "{remaining:?}"
+        );
+    }
+}

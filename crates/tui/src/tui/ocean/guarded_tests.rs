@@ -1,0 +1,195 @@
+use super::*;
+use crate::tui::color_compat::ColorCompatBackend;
+use codewhale_ratatui::ocean::ocean_semantic_surfaces;
+use ratatui::{
+    style::{Modifier, Style},
+    text::{Line, Span},
+};
+
+fn caps(depth: codewhale_palette::ColorDepth) -> codewhale_ratatui::Caps {
+    ColorCompatBackend::new(std::io::sink(), depth, codewhale_palette::PaletteMode::Dark)
+        .native_ocean_caps()
+}
+fn column(area: Rect, phase: ShellPhase, elapsed: u128) -> OceanColumn {
+    OceanColumn::new(
+        OceanRamp::for_theme(&codewhale_palette::UNDERWATER_UI_THEME).unwrap(),
+        area,
+        elapsed,
+        None,
+        phase,
+        true,
+        750,
+        30,
+    )
+    .with_paint_caps(Some(caps(codewhale_palette::ColorDepth::TrueColor)))
+}
+fn ordinary(area: Rect) -> Buffer {
+    let mut buf = Buffer::empty(area);
+    for cell in &mut buf.content {
+        cell.set_bg(codewhale_palette::UNDERWATER_UI_THEME.surface_bg)
+            .set_fg(Color::Rgb(255, 255, 255));
+    }
+    buf
+}
+#[test]
+fn guarded_ocean_backend_depth_is_forwarded_and_explicit_pane_supplies_ground_evidence() {
+    use codewhale_ratatui::{color::ColorDepth as Depth, detect::Appearance};
+    for (host, native) in [
+        (codewhale_palette::ColorDepth::TrueColor, Depth::TrueColor),
+        (codewhale_palette::ColorDepth::Ansi256, Depth::Ansi256),
+        (codewhale_palette::ColorDepth::Ansi16, Depth::Ansi16),
+        (codewhale_palette::ColorDepth::Monochrome, Depth::Monochrome),
+    ] {
+        let reported = caps(host);
+        assert_eq!(reported.depth, native);
+        assert_eq!(
+            reported.appearance,
+            Appearance::Unknown,
+            "OS-dark mode is not measured ground"
+        );
+        let area = Rect::new(7, 5, 12, 4);
+        let mut buf = ordinary(area);
+        let before = buf.clone();
+        let column = column(area, ShellPhase::Idle, 0).with_paint_caps(Some(reported));
+        column.paint_matching_native(
+            area,
+            &mut buf,
+            codewhale_palette::UNDERWATER_UI_THEME.surface_bg,
+            &codewhale_palette::UNDERWATER_UI_THEME,
+            &[],
+        );
+        if native == Depth::TrueColor {
+            assert_ne!(buf, before, "actual dark pane supplies its own evidence");
+        } else {
+            assert_eq!(
+                buf, before,
+                "fallback retains the selected flat pane ground"
+            );
+        }
+    }
+    let area = Rect::new(7, 5, 12, 4);
+    let col = column(area, ShellPhase::Idle, 0);
+    for ground in [Color::Reset, Color::White, Color::Rgb(250, 250, 250)] {
+        let mut buf = ordinary(area);
+        buf.set_style(area, Style::default().bg(ground));
+        let before = buf.clone();
+        col.paint_matching_native(
+            area,
+            &mut buf,
+            ground,
+            &codewhale_palette::UNDERWATER_UI_THEME,
+            &[],
+        );
+        assert_eq!(
+            buf, before,
+            "unknown or known-light explicit grounds cannot earn a dark field"
+        );
+    }
+}
+#[test]
+fn guarded_ocean_semantic_alias_reverse_unknown_ink_and_style_facts_survive_final_shell_pass() {
+    let theme = codewhale_palette::UNDERWATER_UI_THEME;
+    let area = Rect::new(7, 5, 20, 4);
+    let col = column(area, ShellPhase::Idle, 0);
+    let rows = vec![Line::from(vec![
+        Span::raw("plain "),
+        Span::styled(
+            "selected",
+            Style::default()
+                .bg(theme.surface_bg)
+                .add_modifier(Modifier::ITALIC),
+        ),
+    ])];
+    let protected = ocean_semantic_surfaces(
+        &rows,
+        area,
+        codewhale_tui_kit::ui_text::grapheme_display_width,
+    );
+    assert_eq!(protected, vec![Rect::new(13, 5, 8, 1)]);
+    let mut buf = ordinary(area);
+    buf[(7, 6)].set_symbol("x").set_fg(Color::Reset);
+    buf[(8, 6)].set_symbol("x").set_fg(Color::Magenta);
+    buf[(9, 6)].set_symbol("x").set_fg(col.color_at_y(6));
+    buf[(10, 6)].set_bg(theme.selection_bg);
+    buf[(11, 6)]
+        .modifier
+        .insert(Modifier::REVERSED | Modifier::BOLD);
+    let before = buf.clone();
+    col.paint_matching_native(area, &mut buf, theme.surface_bg, &theme, &protected);
+    for x in [8, 10, 11] {
+        assert_eq!(buf[(x, 6)], before[(x, 6)]);
+    }
+    // The terminal backend lifts water-coloured glyphs to visible body ink;
+    // the guard projects that same adaptation before admitting the backdrop.
+    for x in [7, 9] {
+        assert_eq!(buf[(x, 6)].fg, before[(x, 6)].fg);
+        assert_eq!(buf[(x, 6)].modifier, before[(x, 6)].modifier);
+        assert_eq!(buf[(x, 6)].bg, col.color_at_y(6));
+    }
+    for x in 13..21 {
+        assert_eq!(
+            buf[(x, 5)],
+            before[(x, 5)],
+            "explicit style aliases remain semantic"
+        );
+    }
+    assert_eq!(buf[(7, 5)].bg, col.color_at_y(5));
+}
+#[test]
+fn guarded_ocean_uses_backend_projected_custom_ink_and_live_supporting_floor() {
+    let mut theme = codewhale_palette::UNDERWATER_UI_THEME;
+    theme.text_body = Color::Rgb(255, 255, 255);
+    theme.border = Color::Rgb(111, 149, 181);
+    let area = Rect::new(7, 5, 8, 4);
+    let col = column(area, ShellPhase::Idle, 0);
+    let mut buf = ordinary(area);
+    buf[(7, 5)]
+        .set_symbol("x")
+        .set_fg(codewhale_palette::TEXT_BODY);
+    buf[(8, 5)]
+        .set_symbol("|")
+        .set_fg(theme.border)
+        .modifier
+        .insert(Modifier::ITALIC);
+    let before = buf.clone();
+    let projected = crate::tui::color_compat::project_ocean_ink(
+        &buf[(7, 5)],
+        col.color_at_y(5),
+        caps(codewhale_palette::ColorDepth::TrueColor).depth,
+        &theme,
+    );
+    // Underwater retains its body token; custom supporting ink still follows
+    // the live theme and the backend's contrast projection.
+    assert_eq!(projected, codewhale_palette::TEXT_BODY);
+    col.paint_matching_native(area, &mut buf, theme.surface_bg, &theme, &[]);
+    assert_eq!(buf[(7, 5)].bg, col.color_at_y(5));
+    assert_eq!(
+        buf[(7, 5)].fg,
+        before[(7, 5)].fg,
+        "guard never rewrites source ink"
+    );
+    assert_eq!(buf[(8, 5)].modifier, before[(8, 5)].modifier);
+    assert_eq!(buf[(8, 5)].bg, col.color_at_y(5));
+}
+#[test]
+fn guarded_ocean_clip_cannot_modify_cells_outside_the_request() {
+    let area = Rect::new(7, 5, 80, 24);
+    let col = column(area, ShellPhase::Working, 480);
+    let mut buf = ordinary(area);
+    let before = buf.clone();
+    let requested = Rect::new(9, 7, 8, 3);
+    col.paint_matching_native(
+        requested,
+        &mut buf,
+        codewhale_palette::UNDERWATER_UI_THEME.surface_bg,
+        &codewhale_palette::UNDERWATER_UI_THEME,
+        &[],
+    );
+    for y in area.y..area.bottom() {
+        for x in area.x..area.right() {
+            if !requested.contains((x, y).into()) {
+                assert_eq!(buf[(x, y)], before[(x, y)]);
+            }
+        }
+    }
+}

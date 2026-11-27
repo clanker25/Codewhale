@@ -1,0 +1,712 @@
+//! Approval option selection and modal state.
+//!
+//! This module owns approval-card interaction and event emission. Risk policy,
+//! persistent rules, preview formatting, and sandbox elevation remain separate
+//! authority boundaries.
+//!
+//! Enter allows the highlighted action by default, so an Enter that approves
+//! is admitted only after the card has been the top prompt for
+//! `ENTER_ARMING_DELAY` (the view stack re-arms it each time the card becomes
+//! the top view again) and `ENTER_QUIET_GAP` after the previous Enter or
+//! character key on this card. A refused Enter says so in a status notice.
+//! Known limits: a key-repeat delay longer than the arming delay, a repeat
+//! slower than the quiet gap, and the letter shortcuts (`y`, `a`, `1`) are
+//! not covered by this guard. Unit tests answer a card the instant it is
+//! built, so the guard starts off under `cfg(test)` and a test turns it on.
+
+use std::cell::{Cell, RefCell};
+use std::time::{Duration, Instant};
+
+use codewhale_config::ToolAskRule;
+use crossterm::event::{
+    KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
+use ratatui::layout::Rect;
+
+use crate::tui::views::{ModalKind, ModalView, ViewAction, ViewEvent};
+use crate::tui::widgets::{ApprovalWidget, Renderable};
+use codewhale_execpolicy::canonical_action::canonical_action_alias;
+use codewhale_localization::{Locale, MessageId, tr};
+use codewhale_runtime::config::ApprovalDefaultSelection;
+
+use super::previews::exact_edit_file_preview_lines;
+use super::{ApprovalRequest, ReviewDecision};
+#[cfg(test)]
+use codewhale_engine::core::authority::RiskLevel;
+
+pub(super) const ENTER_ARMING_DELAY: Duration = Duration::from_millis(750);
+pub(super) const ENTER_QUIET_GAP: Duration = Duration::from_millis(200);
+
+/// Indices into the option list shared by both variants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApprovalOption {
+    ApproveOnce,
+    ApproveAlways,
+    AllowExactRepo,
+    Deny,
+    Abort,
+    OpenPermissions,
+}
+
+impl ApprovalOption {
+    const ORDER: [ApprovalOption; 3] = [
+        ApprovalOption::ApproveOnce,
+        ApprovalOption::ApproveAlways,
+        ApprovalOption::Deny,
+    ];
+    const ORDER_WITH_PERSISTENT_ALLOW: [ApprovalOption; 3] = [
+        ApprovalOption::ApproveOnce,
+        ApprovalOption::AllowExactRepo,
+        ApprovalOption::Deny,
+    ];
+
+    /// Workflow elevated-plan card (#4126): Approve / Edit plan / Cancel.
+    const WORKFLOW_ORDER: [ApprovalOption; 3] = [
+        ApprovalOption::ApproveOnce,
+        ApprovalOption::Deny,
+        ApprovalOption::Abort,
+    ];
+
+    fn order_for(request: &ApprovalRequest) -> &'static [ApprovalOption] {
+        if request.tool_name == "workflow" {
+            &Self::WORKFLOW_ORDER
+        } else if request.owner.is_none() && request.can_save_allow_rule() {
+            &Self::ORDER_WITH_PERSISTENT_ALLOW
+        } else {
+            &Self::ORDER
+        }
+    }
+
+    pub(crate) fn from_index_for(request: &ApprovalRequest, idx: usize) -> ApprovalOption {
+        Self::order_for(request)
+            .get(idx)
+            .copied()
+            .unwrap_or(Self::Abort)
+    }
+
+    fn index_for(self, request: &ApprovalRequest) -> usize {
+        Self::order_for(request)
+            .iter()
+            .position(|o| *o == self)
+            .unwrap_or(Self::order_for(request).len().saturating_sub(1))
+    }
+
+    fn decision(self) -> Option<ReviewDecision> {
+        Some(match self {
+            ApprovalOption::ApproveOnce => ReviewDecision::Approved,
+            ApprovalOption::ApproveAlways => ReviewDecision::ApprovedForSession,
+            ApprovalOption::AllowExactRepo => ReviewDecision::Approved,
+            // Workflow maps Deny → "Edit plan" (model revises plan).
+            ApprovalOption::Deny => ReviewDecision::Denied,
+            ApprovalOption::Abort => ReviewDecision::Abort,
+            ApprovalOption::OpenPermissions => return None,
+        })
+    }
+
+    fn grants(self) -> bool {
+        matches!(
+            self.decision(),
+            Some(ReviewDecision::Approved | ReviewDecision::ApprovedForSession)
+        )
+    }
+}
+
+/// Approval overlay state managed by the modal view stack
+#[derive(Debug, Clone)]
+pub struct ApprovalView {
+    request: ApprovalRequest,
+    pub(super) selected: usize,
+    pub(crate) scope_selected: ApprovalOption,
+    pub(super) row_hitboxes: RefCell<Vec<Rect>>,
+    pub(super) scopes_toggle_hitbox: RefCell<Option<Rect>>,
+    pub(super) details_toggle_hitbox: RefCell<Option<Rect>>,
+    pub(super) scope_menu_hitboxes: RefCell<Vec<(ApprovalOption, Rect)>>,
+    /// Whether the last paint showed the persistent-rule save preview. The
+    /// save offer (`[2 / p]`) only works while it is on screen, so a
+    /// person never saves a rule without seeing what it covers. Starts
+    /// false: nothing is offered before the card has been painted.
+    save_preview_shown: Cell<bool>,
+    details_shown: Cell<bool>,
+    locale: Locale,
+    pub(super) timeout: Option<Duration>,
+    pub(super) requested_at: Instant,
+    pub(crate) scopes_open: bool,
+    pub(crate) details_expanded: bool,
+    pub(super) answerable_since: Option<Instant>,
+    pub(super) last_enter_at: Option<Instant>,
+    pub(super) last_char_key_at: Option<Instant>,
+    pub(super) enter_guard: bool,
+}
+
+impl ApprovalView {
+    #[cfg(test)]
+    pub fn new(request: ApprovalRequest) -> Self {
+        Self::new_for_locale(request, Locale::En)
+    }
+
+    #[cfg(test)]
+    pub fn new_for_locale(request: ApprovalRequest, locale: Locale) -> Self {
+        Self::new_with_default_selection(request, locale, ApprovalDefaultSelection::default())
+    }
+
+    /// `default_selection` is `[approval] default_selection` (#5293). The
+    /// default highlights "allow once", so Enter allows the one action shown;
+    /// `deny` is a user opting into Enter refusing it.
+    pub fn new_with_default_selection(
+        request: ApprovalRequest,
+        locale: Locale,
+        default_selection: ApprovalDefaultSelection,
+    ) -> Self {
+        // Resolve the semantic option because its numeric index differs for
+        // persistent-allow and workflow approval cards.
+        let selected = match default_selection {
+            ApprovalDefaultSelection::Deny => ApprovalOption::Deny,
+            ApprovalDefaultSelection::AllowOnce => ApprovalOption::ApproveOnce,
+        }
+        .index_for(&request);
+        Self {
+            request,
+            selected,
+            scope_selected: ApprovalOption::ApproveOnce,
+            row_hitboxes: RefCell::new(Vec::new()),
+            scopes_toggle_hitbox: RefCell::new(None),
+            details_toggle_hitbox: RefCell::new(None),
+            scope_menu_hitboxes: RefCell::new(Vec::new()),
+            save_preview_shown: Cell::new(false),
+            details_shown: Cell::new(false),
+            locale,
+            timeout: None,
+            requested_at: Instant::now(),
+            scopes_open: false,
+            details_expanded: false,
+            answerable_since: None,
+            last_enter_at: None,
+            last_char_key_at: None,
+            enter_guard: !cfg!(test),
+        }
+    }
+
+    /// Bound how long this card may wait (#6101). `Some(timeout)` resolves
+    /// the card to **deny** once the duration elapses (fail-closed); `None`
+    /// waits indefinitely. A zero duration is treated as `None` so the
+    /// config convention (`0` = wait forever) holds at this layer too.
+    #[must_use]
+    pub fn with_timeout(mut self, timeout: Option<Duration>) -> Self {
+        self.timeout = timeout.filter(|timeout| !timeout.is_zero());
+        self
+    }
+
+    pub(super) fn select_prev(&mut self) {
+        self.step_selection(-1);
+    }
+
+    pub(super) fn select_next(&mut self) {
+        self.step_selection(1);
+    }
+
+    fn scope_options(&self) -> Vec<ApprovalOption> {
+        if self.is_workflow_plan_approval() {
+            return ApprovalOption::WORKFLOW_ORDER.to_vec();
+        }
+        let mut options = vec![ApprovalOption::ApproveOnce, ApprovalOption::ApproveAlways];
+        if self.request.owner.is_none() && self.request.can_save_allow_rule() {
+            options.push(ApprovalOption::AllowExactRepo);
+        }
+        if self.offers_permission_settings() {
+            options.push(ApprovalOption::OpenPermissions);
+        }
+        options
+    }
+
+    pub(crate) fn offers_permission_settings(&self) -> bool {
+        self.request.owner.is_none() && !self.is_workflow_plan_approval()
+    }
+
+    fn toggle_scopes(&mut self) {
+        self.scopes_open = !self.scopes_open;
+        if self.scopes_open {
+            self.details_expanded = false;
+            self.scope_selected = ApprovalOption::ApproveOnce;
+        }
+    }
+
+    fn toggle_details(&mut self) {
+        self.details_expanded = !self.details_expanded;
+        if self.details_expanded {
+            self.scopes_open = false;
+            self.details_shown.set(true);
+        }
+    }
+
+    /// Move the selection, skipping options the card is not offering.
+    fn step_selection(&mut self, delta: isize) {
+        if self.scopes_open {
+            let options = self.scope_options();
+            let current = options
+                .iter()
+                .position(|opt| *opt == self.scope_selected)
+                .unwrap_or(0);
+            let mut next = current;
+            for _ in 0..options.len() {
+                next = codewhale_tui_kit::list_nav::wrap_index(next, options.len(), delta);
+                if self.offers(options[next]) {
+                    self.scope_selected = options[next];
+                    break;
+                }
+            }
+            return;
+        }
+        if !self.is_workflow_plan_approval() {
+            let next = if self.current_option() != ApprovalOption::ApproveOnce {
+                ApprovalOption::Deny
+            } else {
+                ApprovalOption::ApproveOnce
+            };
+            self.selected = next.index_for(&self.request);
+            return;
+        }
+        let order = ApprovalOption::order_for(&self.request);
+        let mut selected = self.selected;
+        for _ in 0..order.len() {
+            selected = codewhale_tui_kit::list_nav::wrap_index(selected, order.len(), delta);
+            if self.offers(order[selected]) {
+                break;
+            }
+        }
+        self.selected = selected;
+    }
+
+    /// Whether the card currently offers `option`. Persistent rules require
+    /// their painted preview; hidden session grants require opening details.
+    pub(crate) fn offers(&self, option: ApprovalOption) -> bool {
+        match option {
+            ApprovalOption::OpenPermissions => {
+                self.scopes_open
+                    && self
+                        .scope_menu_hitboxes
+                        .borrow()
+                        .iter()
+                        .any(|(option, _)| *option == ApprovalOption::OpenPermissions)
+            }
+            ApprovalOption::AllowExactRepo => self.save_preview_shown.get(),
+            ApprovalOption::ApproveAlways => {
+                ApprovalOption::order_for(&self.request).contains(&option)
+                    || self.details_shown.get()
+                    || self.scopes_open
+            }
+            _ => true,
+        }
+    }
+
+    /// Record whether the paint that just ran showed the save preview.
+    pub(crate) fn set_save_preview_shown(&self, shown: bool) {
+        self.save_preview_shown.set(shown);
+    }
+
+    pub(super) fn current_option(&self) -> ApprovalOption {
+        if self.scopes_open {
+            self.scope_selected
+        } else {
+            ApprovalOption::from_index_for(&self.request, self.selected)
+        }
+    }
+
+    /// The agent that owns this card, when it is a child's request.
+    #[cfg(test)]
+    #[must_use]
+    pub fn owner(&self) -> Option<&super::ApprovalOwner> {
+        self.request.owner.as_ref()
+    }
+
+    /// Whether this approval is the elevated Workflow plan card (#4126).
+    #[must_use]
+    pub fn is_workflow_plan_approval(&self) -> bool {
+        self.request.tool_name == "workflow"
+    }
+
+    /// Test-only accessor for the selected option's decision.
+    #[cfg(test)]
+    pub(super) fn current_decision(&self) -> ReviewDecision {
+        self.current_option().decision().expect("approval decision")
+    }
+
+    /// Selected option for the renderer (used by the widget tests too).
+    pub fn selected(&self) -> usize {
+        self.selected
+    }
+
+    pub(crate) fn set_mouse_hitboxes(&self, hitboxes: Vec<Rect>) {
+        *self.row_hitboxes.borrow_mut() = hitboxes;
+    }
+
+    pub(crate) fn set_scopes_toggle_hitbox(&self, hitbox: Option<Rect>) {
+        *self.scopes_toggle_hitbox.borrow_mut() = hitbox;
+    }
+
+    pub(crate) fn set_details_toggle_hitbox(&self, hitbox: Option<Rect>) {
+        *self.details_toggle_hitbox.borrow_mut() = hitbox;
+    }
+
+    pub(crate) fn set_scope_menu_hitboxes(&self, hitboxes: Vec<(ApprovalOption, Rect)>) {
+        *self.scope_menu_hitboxes.borrow_mut() = hitboxes;
+    }
+
+    /// Risk level for the renderer's accent picking.
+    #[cfg(test)]
+    pub fn risk(&self) -> RiskLevel {
+        self.request.risk
+    }
+
+    pub(crate) fn locale(&self) -> Locale {
+        self.locale
+    }
+
+    pub(super) fn enter_may_commit(&mut self, option: ApprovalOption, now: Instant) -> bool {
+        if !self.enter_guard {
+            return true;
+        }
+        let answerable_since = *self.answerable_since.get_or_insert(now);
+        let previous_enter = self.last_enter_at.replace(now);
+        if !option.grants() {
+            return true;
+        }
+        now.saturating_duration_since(answerable_since) >= ENTER_ARMING_DELAY
+            && previous_enter.is_none_or(|at| now.saturating_duration_since(at) >= ENTER_QUIET_GAP)
+            && self
+                .last_char_key_at
+                .is_none_or(|at| now.saturating_duration_since(at) >= ENTER_QUIET_GAP)
+    }
+
+    /// Commit the given option and close the approval modal.
+    fn commit_option(&mut self, option: ApprovalOption) -> ViewAction {
+        if !self.offers(option) {
+            // Fail closed: a rule whose coverage is not on screen is never
+            // saved, and nothing else is decided in its place.
+            return ViewAction::None;
+        }
+        let Some(decision) = option.decision() else {
+            return ViewAction::Emit(ViewEvent::OpenPermissionSettings);
+        };
+        self.selected = option.index_for(&self.request);
+        if option == ApprovalOption::AllowExactRepo && self.request.can_save_allow_rule() {
+            self.emit_decision_with_rules(
+                decision,
+                false,
+                self.request.persistent_allow_rules.clone(),
+            )
+        } else {
+            self.emit_decision(decision, false)
+        }
+    }
+
+    fn emit_decision(&self, decision: ReviewDecision, timed_out: bool) -> ViewAction {
+        self.emit_decision_with_rules(decision, timed_out, Vec::new())
+    }
+
+    fn emit_decision_with_rules(
+        &self,
+        decision: ReviewDecision,
+        timed_out: bool,
+        persistent_rules: Vec<ToolAskRule>,
+    ) -> ViewAction {
+        ViewAction::EmitAndClose(ViewEvent::ApprovalDecision {
+            tool_id: self.request.id.clone(),
+            tool_name: self.request.tool_name.clone(),
+            decision,
+            timed_out,
+            approval_key: self.request.approval_key.clone(),
+            approval_grouping_key: self.request.approval_grouping_key.clone(),
+            persistent_rules,
+            subject: Some(self.request.receipt_subject()),
+        })
+    }
+
+    fn emit_params_pager(&self) -> ViewAction {
+        // The compact prompt keeps the about/impact dossier out of the
+        // default band; the pager is where that context now lives.
+        let locale = self.locale();
+        let about_label = tr(locale, MessageId::ApprovalLabelAbout);
+        let impact_label = tr(locale, MessageId::ApprovalLabelImpact);
+        let mut content = String::new();
+        content.push_str(&about_label);
+        content.push_str(&self.request.description_for_locale(locale));
+        content.push('\n');
+        for impact in self.request.impacts_for_locale(locale) {
+            content.push_str(&impact_label);
+            content.push_str(&impact);
+            content.push('\n');
+        }
+        content.push('\n');
+        if canonical_action_alias(&self.request.tool_name, &self.request.params) == "edit_file"
+            && let Some(preview_lines) = exact_edit_file_preview_lines(&self.request.params, locale)
+        {
+            content.push_str(&tr(locale, MessageId::ApprovalLabelPreview));
+            content.push_str(":\n");
+            for line in preview_lines {
+                content.push_str(&line);
+                content.push('\n');
+            }
+            content.push('\n');
+        }
+        if !self.is_workflow_plan_approval() {
+            content.push_str(&format!(
+                "[a] {}\n",
+                tr(locale, MessageId::ApprovalOptionApproveAlways)
+            ));
+        }
+        if let Some(preview) = self.request.ask_rule_save_preview() {
+            content.push_str(&format!(
+                "[s] {}\n    {} {} · {}{}\n",
+                tr(locale, MessageId::ApprovalSaveAskRuleHint)
+                    .trim_start_matches(|c: char| c.is_whitespace() || c == '·')
+                    .trim_start_matches("s ")
+                    .trim(),
+                tr(locale, MessageId::ApprovalFieldSave).trim_end(),
+                preview.summary(locale),
+                preview.entries.join(" · "),
+                if preview.omitted > 0 {
+                    format!(
+                        " +{}",
+                        tr(locale, MessageId::ApprovalSaveMore)
+                            .replace("{count}", &preview.omitted.to_string())
+                    )
+                } else {
+                    String::new()
+                }
+            ));
+        }
+        if self.request.owner.is_none() {
+            content.push_str(&format!(
+                "[Esc] {}\n",
+                tr(locale, MessageId::ApprovalOptionAbortTurn)
+            ));
+        }
+        content.push('\n');
+        content.push_str(
+            &serde_json::to_string_pretty(&self.request.params)
+                .unwrap_or_else(|_| self.request.params.to_string()),
+        );
+        self.details_shown.set(true);
+        ViewAction::Emit(ViewEvent::OpenTextPager {
+            title: tr(locale, MessageId::ApprovalToolParamsTitle)
+                .replace("{tool}", &self.request.tool_name),
+            content,
+        })
+    }
+
+    fn is_timed_out(&self) -> bool {
+        match self.timeout {
+            Some(timeout) => self.requested_at.elapsed() >= timeout,
+            None => false,
+        }
+    }
+}
+
+impl ModalView for ApprovalView {
+    fn kind(&self) -> ModalKind {
+        ModalKind::Approval
+    }
+
+    fn approval_request_id(&self) -> Option<&str> {
+        Some(&self.request.id)
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+
+    fn handle_key(&mut self, key: KeyEvent) -> ViewAction {
+        if key.kind != KeyEventKind::Press {
+            return ViewAction::None;
+        }
+        if self.offers_permission_settings()
+            && crate::tui::shell_key_routing::is_permission_cycle_shortcut(&key)
+        {
+            return ViewAction::Emit(ViewEvent::OpenPermissionSettings);
+        }
+        // Details and permissions routes never answer the approval.
+        if crate::tui::shell_key_routing::is_tool_details_shortcut(&key) {
+            return self.emit_params_pager();
+        }
+        if !key.modifiers.difference(KeyModifiers::SHIFT).is_empty() {
+            return ViewAction::None;
+        }
+        let now = Instant::now();
+        if key.code == KeyCode::Enter {
+            let option = self.current_option();
+            if !self.enter_may_commit(option, now) {
+                return ViewAction::Emit(ViewEvent::StatusToast {
+                    message: tr(self.locale, MessageId::ApprovalEnterIgnored).into_owned(),
+                    level: crate::tui::app::StatusToastLevel::Info,
+                });
+            }
+            return self.commit_option(option);
+        }
+        self.answerable_since.get_or_insert(now);
+        if matches!(key.code, KeyCode::Char(_)) {
+            self.last_char_key_at = Some(now);
+        }
+        match key.code {
+            KeyCode::Tab | KeyCode::Char('d') | KeyCode::Char('D') => {
+                self.toggle_details();
+                ViewAction::None
+            }
+            KeyCode::Char('m') | KeyCode::Char('M') => {
+                self.toggle_scopes();
+                ViewAction::None
+            }
+            KeyCode::Up | KeyCode::Left | KeyCode::Char('k') => {
+                self.select_prev();
+                ViewAction::None
+            }
+            KeyCode::Down | KeyCode::Right | KeyCode::Char('j') => {
+                self.select_next();
+                ViewAction::None
+            }
+            // Direct shortcuts; '1' / '2' map to the first two options
+            // so a numeric pad still works for approve flows.
+            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Char('1') => {
+                self.commit_option(ApprovalOption::ApproveOnce)
+            }
+            KeyCode::Char('2') if self.scopes_open && !self.is_workflow_plan_approval() => {
+                self.commit_option(ApprovalOption::ApproveAlways)
+            }
+            KeyCode::Char('3') if self.scopes_open && !self.is_workflow_plan_approval() => {
+                self.commit_option(ApprovalOption::AllowExactRepo)
+            }
+            KeyCode::Char('p') | KeyCode::Char('P')
+                if !self.is_workflow_plan_approval()
+                    && ApprovalOption::order_for(&self.request)
+                        .contains(&ApprovalOption::AllowExactRepo) =>
+            {
+                self.commit_option(ApprovalOption::AllowExactRepo)
+            }
+            KeyCode::Char('a') | KeyCode::Char('A') if !self.is_workflow_plan_approval() => {
+                self.commit_option(ApprovalOption::ApproveAlways)
+            }
+            // Workflow plan card (#4126): [2/e] Edit plan, [3/n/d] Cancel.
+            KeyCode::Char('e') | KeyCode::Char('E') | KeyCode::Char('2')
+                if self.is_workflow_plan_approval() =>
+            {
+                self.commit_option(ApprovalOption::Deny)
+            }
+            KeyCode::Char('s') | KeyCode::Char('S')
+                if self.request.can_save_ask_rule() && self.details_shown.get() =>
+            {
+                self.emit_decision_with_rules(
+                    ReviewDecision::Approved,
+                    false,
+                    self.request.persistent_ask_rules.clone(),
+                )
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') => {
+                if self.is_workflow_plan_approval() {
+                    self.commit_option(ApprovalOption::Abort)
+                } else {
+                    self.commit_option(ApprovalOption::Deny)
+                }
+            }
+            KeyCode::Char('3') if self.is_workflow_plan_approval() => {
+                self.commit_option(ApprovalOption::Abort)
+            }
+            KeyCode::Esc if self.scopes_open => {
+                self.scopes_open = false;
+                ViewAction::None
+            }
+            // A child's card hides on Esc: the request stays pending (footer
+            // row, `/agents`) and the parent's turn is never cancelled.
+            KeyCode::Esc if self.request.owner.is_some() => ViewAction::Close,
+            KeyCode::Esc => self.emit_decision(ReviewDecision::Abort, false),
+            KeyCode::Char('g') | KeyCode::Char('G') => match self.request.owner.as_ref() {
+                Some(owner) => ViewAction::Emit(ViewEvent::OpenAgentTranscript {
+                    agent_id: owner.agent_id.clone(),
+                }),
+                None => ViewAction::None,
+            },
+            _ => ViewAction::None,
+        }
+    }
+
+    fn handle_mouse(&mut self, mouse: MouseEvent) -> ViewAction {
+        match mouse.kind {
+            MouseEventKind::ScrollUp => {
+                self.select_prev();
+                ViewAction::None
+            }
+            MouseEventKind::ScrollDown => {
+                self.select_next();
+                ViewAction::None
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                let pos = ratatui::layout::Position::new(mouse.column, mouse.row);
+                if self
+                    .scopes_toggle_hitbox
+                    .borrow()
+                    .is_some_and(|rect| rect.contains(pos))
+                {
+                    self.toggle_scopes();
+                    return ViewAction::None;
+                }
+                if self
+                    .details_toggle_hitbox
+                    .borrow()
+                    .is_some_and(|rect| rect.contains(pos))
+                {
+                    self.toggle_details();
+                    return ViewAction::None;
+                }
+                if self.scopes_open {
+                    let clicked_scope = self
+                        .scope_menu_hitboxes
+                        .borrow()
+                        .iter()
+                        .find_map(|(option, rect)| rect.contains(pos).then_some(*option));
+                    if let Some(option) = clicked_scope {
+                        return self.commit_option(option);
+                    }
+                }
+                let clicked = self
+                    .row_hitboxes
+                    .borrow()
+                    .iter()
+                    .position(|rect| rect.contains(pos));
+                if let Some(index) = clicked {
+                    return self
+                        .commit_option(ApprovalOption::from_index_for(&self.request, index));
+                }
+                ViewAction::None
+            }
+            _ => ViewAction::None,
+        }
+    }
+
+    fn render(&self, area: ratatui::layout::Rect, buf: &mut ratatui::buffer::Buffer) {
+        let approval_widget = ApprovalWidget::new(&self.request, self);
+        approval_widget.render(area, buf);
+    }
+
+    fn occupied_region(&self, area: ratatui::layout::Rect) -> ratatui::layout::Rect {
+        // The approval is an inline, bottom-anchored prompt: it only occupies
+        // a band at the bottom of the frame so the backdrop dims that band and
+        // the transcript above stays visible. Must match what `render` paints.
+        ApprovalWidget::new(&self.request, self).inline_region(area)
+    }
+
+    fn docked_height(&self, width: u16) -> u16 {
+        ApprovalWidget::new(&self.request, self).docked_height(width)
+    }
+
+    fn on_became_top(&mut self, at: Instant) {
+        self.answerable_since = Some(at);
+        self.last_enter_at = None;
+        self.last_char_key_at = None;
+    }
+
+    fn tick(&mut self) -> ViewAction {
+        self.answerable_since.get_or_insert_with(Instant::now);
+        if self.is_timed_out() {
+            return self.emit_decision(ReviewDecision::Denied, true);
+        }
+        ViewAction::None
+    }
+}

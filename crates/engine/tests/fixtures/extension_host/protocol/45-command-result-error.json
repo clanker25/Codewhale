@@ -1,0 +1,12 @@
+{
+  "direction": "host_to_core",
+  "valid": false,
+  "frame": {
+    "jsonrpc": "2.0",
+    "id": 5,
+    "result": {
+      "kind": "error",
+      "text": "unknown topic"
+    }
+  }
+}

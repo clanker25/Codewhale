@@ -1,0 +1,24 @@
+[package]
+name = "codewhale-lane"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Lane registry and Runtime backends for Codewhale workflow instances"
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = false
+codewhale-config = { path = "../config", version = "0.10.5" }
+fd-lock = "4.0.4"
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = false
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = false

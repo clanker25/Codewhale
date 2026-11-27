@@ -1,0 +1,17 @@
+node_modules/
+dist/
+conformance-results/
+digests-*.txt
+**/build/
+**/target/
+rs/petsim
+/android/
+/ios/
+/macos/
+/shots/
+/swift/
+/world/
+*.log
+*.jsonl
+!**/fixtures/*.jsonl
+.DS_Store

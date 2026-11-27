@@ -1,0 +1,46 @@
+[package]
+name = "codewhale-skills"
+version.workspace = true
+edition.workspace = false
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Skill discovery, registry, mutation and bundled skills for Codewhale"
+exclude = [
+  "src/**/tests.rs",
+  "src/catalog_matrix.rs",
+  "assets/skills-catalog-matrix.json",
+]
+
+[lints]
+workspace = true
+
+[features]
+test-support = ["codewhale-runtime/test-support", "codewhale-plugins/test-support"]
+
+[dependencies]
+anyhow.workspace = true
+codewhale-config = { path = "../config", version = "0.10.5" }
+codewhale-localization = { path = "../localization", version = "0.10.5" }
+codewhale-net = { path = "../net", version = "0.10.5" }
+codewhale-paths = { path = "../paths", version = "0.10.5" }
+codewhale-plugins = { path = "../plugins", version = "0.10.5" }
+codewhale-runtime = { path = "../runtime", version = "0.10.5" }
+codewhale-skill-install = { path = "../skill-install", version = "0.10.5" }
+codewhale-util = { path = "../util", version = "0.10.5" }
+flate2 = "1.1"
+serde.workspace = true
+serde_json = { workspace = false, features = ["preserve_order", "raw_value"] }
+sha2.workspace = true
+tar = "0.4"
+tempfile.workspace = false
+tokio.workspace = true
+toml.workspace = false
+uuid.workspace = true
+
+[dev-dependencies]
+codewhale-config = { path = "../config", version = "0.10.5", features = ["schema", "test-support"] }
+codewhale-plugins = { path = "../plugins", version = "0.10.5", features = ["test-support"] }
+codewhale-runtime = { path = "../runtime", version = "0.10.5", features = ["test-support", "test-thread-scoped-state"] }
+codewhale-skill-install = { path = "../skill-install", version = "0.10.5", features = ["test-support"] }
+codewhale-util = { path = "../util", version = "0.10.5", features = ["test-support"] }

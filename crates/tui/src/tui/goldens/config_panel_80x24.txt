@@ -1,0 +1,24 @@
+                                                                                
+ ╭ Settings ────────────────────────────────────────────── Appearance · 22/70 ╮ 
+ │  Appearance   Models & providers   Work   Tools & MCP   Trust   Advanced   │ 
+ │  Search: type to filter  (22/70)                                           │ 
+ │ ────────────────────────────────────────────────────────────────────────── │ 
+ │   Display                                                                █ │ 
+ │ ▸ Theme                              terminal               ‹ ›  changed █ │ 
+ │   Language                           auto                   ‹ ›          █ │ 
+ │   Background                         (default)              ✎            █ │ 
+ │   Whale view                         ○ Off                               █ │ 
+ │   Whale name                                                ✎            █ │ 
+ │   Whale colour                                              ✎            │ │ 
+ │   Quiet transcript                   ● On                                │ │ 
+ │   Model reasoning in chat            ● On                                │ │ 
+ │   Expand reasoning by default        ○ Off                               │ │ 
+ │   Reasoning preview lines            2                      ✎            │ │ 
+ │   Thinking background highlight      ● On                                │ │ 
+ │ system | terminal | shoreline | shoreline-light | underwater |…            │ 
+ │ Enter or click again: opens choices · Theme: current terminal · saved      │ 
+ │ terminal · applies on save                                                 │ 
+ │ Preview:  ● Accept Edits                                                   │ 
+ │ ↑↓ move · Enter edits · Tab switch · Esc close                             │ 
+ ╰────────────────────────────────────────────────────────────────────────────╯ 
+                                                                                

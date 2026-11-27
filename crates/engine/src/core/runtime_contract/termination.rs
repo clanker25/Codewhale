@@ -1,0 +1,207 @@
+use serde::{Deserialize, Serialize};
+
+/// Terminal reasons shared by TUI, JSONL, Fleet, and benchmark receipts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunTerminationReason {
+    Resolved,
+    Unresolved,
+    Canceled,
+    Stuck,
+    Timeout,
+    BudgetExhausted,
+    ApprovalRequired,
+    ModelError,
+    ToolError,
+    InfrastructureError,
+    EvidenceMissing,
+}
+
+impl RunTerminationReason {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Resolved => "resolved",
+            Self::Unresolved => "unresolved",
+            Self::Canceled => "canceled",
+            Self::Stuck => "stuck",
+            Self::Timeout => "timeout",
+            Self::BudgetExhausted => "budget_exhausted",
+            Self::ApprovalRequired => "approval_required",
+            Self::ModelError => "model_error",
+            Self::ToolError => "tool_error",
+            Self::InfrastructureError => "infrastructure_error",
+            Self::EvidenceMissing => "evidence_missing",
+        }
+    }
+
+    #[must_use]
+    pub const fn is_success(self) -> bool {
+        matches!(self, Self::Resolved)
+    }
+
+    #[must_use]
+    pub const fn process_exit_code(self) -> i32 {
+        match self {
+            Self::Resolved => 0,
+            Self::Unresolved | Self::EvidenceMissing => 2,
+            Self::ApprovalRequired => 3,
+            Self::Canceled => 130,
+            Self::Stuck
+            | Self::Timeout
+            | Self::BudgetExhausted
+            | Self::ModelError
+            | Self::ToolError
+            | Self::InfrastructureError => 1,
+        }
+    }
+}
+
+/// Reduce the existing Engine outcome plus typed subsystem evidence into the
+/// terminal status shared by machine-facing projections. Successful and
+/// canceled turns are unambiguous. For failed turns, the terminal error
+/// category wins over historical tool failures from earlier, recovered steps;
+/// approval/tool evidence is the fallback when the terminal event has no
+/// typed cause.
+#[must_use]
+pub fn classify_turn_termination(
+    status: crate::core::events::TurnOutcomeStatus,
+    error_category: Option<codewhale_error_taxonomy::ErrorCategory>,
+    tool_error_seen: bool,
+    approval_required: bool,
+) -> RunTerminationReason {
+    use crate::core::events::TurnOutcomeStatus;
+    use codewhale_error_taxonomy::ErrorCategory;
+
+    match status {
+        TurnOutcomeStatus::Completed => RunTerminationReason::Resolved,
+        TurnOutcomeStatus::Interrupted => RunTerminationReason::Canceled,
+        TurnOutcomeStatus::Failed => match error_category {
+            Some(ErrorCategory::Budget) => RunTerminationReason::BudgetExhausted,
+            Some(ErrorCategory::Timeout) => RunTerminationReason::Timeout,
+            Some(
+                ErrorCategory::Network
+                | ErrorCategory::Authentication
+                | ErrorCategory::Authorization
+                | ErrorCategory::RateLimit
+                | ErrorCategory::InvalidInput
+                | ErrorCategory::Parse,
+            ) => RunTerminationReason::ModelError,
+            Some(ErrorCategory::Tool) => RunTerminationReason::ToolError,
+            Some(ErrorCategory::State | ErrorCategory::Internal) => {
+                RunTerminationReason::InfrastructureError
+            }
+            None if approval_required => RunTerminationReason::ApprovalRequired,
+            None if tool_error_seen => RunTerminationReason::ToolError,
+            None => RunTerminationReason::Unresolved,
+        },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn approval_required_has_machine_distinct_exit() {
+        assert_eq!(
+            RunTerminationReason::ApprovalRequired.process_exit_code(),
+            3
+        );
+        assert!(!RunTerminationReason::ApprovalRequired.is_success());
+    }
+
+    #[test]
+    fn failed_turns_keep_model_tool_and_infrastructure_distinct() {
+        use crate::core::events::TurnOutcomeStatus;
+        use codewhale_error_taxonomy::ErrorCategory;
+
+        assert_eq!(
+            classify_turn_termination(
+                TurnOutcomeStatus::Failed,
+                Some(ErrorCategory::Network),
+                false,
+                false,
+            ),
+            RunTerminationReason::ModelError
+        );
+        assert_eq!(
+            classify_turn_termination(
+                TurnOutcomeStatus::Failed,
+                Some(ErrorCategory::InvalidInput),
+                false,
+                false,
+            ),
+            RunTerminationReason::ModelError
+        );
+        assert_eq!(
+            classify_turn_termination(
+                TurnOutcomeStatus::Failed,
+                Some(ErrorCategory::Internal),
+                false,
+                false,
+            ),
+            RunTerminationReason::InfrastructureError
+        );
+        assert_eq!(
+            classify_turn_termination(TurnOutcomeStatus::Failed, None, true, false),
+            RunTerminationReason::ToolError
+        );
+        assert_eq!(
+            classify_turn_termination(
+                TurnOutcomeStatus::Failed,
+                Some(ErrorCategory::InvalidInput),
+                true,
+                false,
+            ),
+            RunTerminationReason::ModelError,
+            "a recovered tool error must not hide the terminal model failure"
+        );
+        assert_eq!(
+            classify_turn_termination(
+                TurnOutcomeStatus::Failed,
+                Some(ErrorCategory::InvalidInput),
+                true,
+                true,
+            ),
+            RunTerminationReason::ModelError,
+            "historical approval evidence must not hide terminal truncation"
+        );
+    }
+
+    #[test]
+    fn typed_error_categories_precede_approval_required_fallback() {
+        use crate::core::events::TurnOutcomeStatus;
+        use codewhale_error_taxonomy::ErrorCategory;
+
+        for (category, expected) in [
+            (ErrorCategory::Budget, RunTerminationReason::BudgetExhausted),
+            (ErrorCategory::Timeout, RunTerminationReason::Timeout),
+            (ErrorCategory::Network, RunTerminationReason::ModelError),
+            (ErrorCategory::Tool, RunTerminationReason::ToolError),
+            (
+                ErrorCategory::State,
+                RunTerminationReason::InfrastructureError,
+            ),
+            (
+                ErrorCategory::Internal,
+                RunTerminationReason::InfrastructureError,
+            ),
+        ] {
+            assert_eq!(
+                classify_turn_termination(TurnOutcomeStatus::Failed, Some(category), false, true),
+                expected,
+                "typed category {category:?} must win over historical approval_required"
+            );
+        }
+
+        assert_eq!(
+            classify_turn_termination(TurnOutcomeStatus::Failed, None, false, true),
+            RunTerminationReason::ApprovalRequired
+        );
+        assert_eq!(
+            classify_turn_termination(TurnOutcomeStatus::Failed, None, true, true),
+            RunTerminationReason::ApprovalRequired
+        );
+    }
+}

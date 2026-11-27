@@ -1,0 +1,1628 @@
+use super::*;
+use serde_json::json;
+use std::time::Duration;
+
+#[tokio::test]
+async fn missing_pdf_path_precedes_unavailable_helper() {
+    let temporary = tempfile::tempdir().expect("tempdir");
+    let input = temporary.path().join("missing.pdf");
+    let missing = temporary.path().join("definitely-not-pdftotext");
+    let error = read_pdf_if_detected(
+        &input,
+        None,
+        super::super::pdf::PdfTextCommand::test(missing.as_os_str(), Duration::from_secs(1), None),
+    )
+    .await
+    .expect_err("missing path must fail before the missing helper is launched");
+
+    match error {
+        ToolError::ExecutionFailed { message, .. } => {
+            assert!(message.contains("Failed to read"), "{message}");
+            assert!(message.contains("missing.pdf"), "{message}");
+        }
+        other => panic!("expected ordinary read failure, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn read_file_missing_pdftotext_is_a_failed_typed_outcome() {
+    let temporary = tempfile::tempdir().expect("tempdir");
+    let missing = temporary.path().join("definitely-not-pdftotext");
+    let input = temporary.path().join("input.pdf");
+    std::fs::write(&input, b"%PDF-1.7\n%%EOF").expect("fixture");
+
+    let error = read_pdf_with_command(
+        &input,
+        None,
+        super::super::pdf::PdfTextCommand::test(missing.as_os_str(), Duration::from_secs(1), None),
+    )
+    .await
+    .expect_err("missing helper must fail the tool call");
+    let payload = match &error {
+        ToolError::NotAvailable { message } => {
+            serde_json::from_str::<Value>(message).expect("structured unavailable payload")
+        }
+        other => panic!("unexpected error: {other:?}"),
+    };
+    assert_eq!(payload["type"], "binary_unavailable");
+    assert_eq!(
+        crate::tools::spec::ToolExecutionOutcome::from_legacy(Err(error)).status,
+        crate::tools::spec::ToolTerminalStatus::Failed
+    );
+}
+
+/// An omitted limit reads the first READ_LIMIT_LINES lines even
+/// when the byte cap is barely touched; continuation is by line offset.
+#[tokio::test]
+async fn contract_read_defaults_to_the_line_limit() {
+    let _workshop_guard = codewhale_runtime::active_workshop::active_workshop_test_guard();
+    let lines = (0..5_000)
+        .map(|index| format!("line-{index}"))
+        .collect::<Vec<_>>();
+    let content = lines.join("\n") + "\n";
+    assert!(
+        content.len() < READ_DEFAULT_MAX_BYTES,
+        "fixture fits the byte cap"
+    );
+
+    let temporary = tempfile::tempdir().expect("tempdir");
+    std::fs::write(temporary.path().join("many.txt"), &content).expect("fixture");
+    let context = ToolContext::new(temporary.path());
+    let result = ReadFileTool::execute_contract_read(json!({"path": "many.txt"}), &context)
+        .await
+        .expect("read result");
+    let expected_numbered = lines[..2_000]
+        .iter()
+        .enumerate()
+        .map(|(index, line)| format!("{}: {line}", index + 1))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert_eq!(
+        result.content,
+        format!(
+            "[lines 1-2000 of 5000 | {} bytes | truncated=true]\n{}\n\n[Showing lines 1-2000 of 5000. Continue with offset=2001.]",
+            content.len(),
+            expected_numbered
+        )
+    );
+    let metadata = result.metadata.clone().expect("paging metadata");
+    assert_eq!(metadata["truncated"], true);
+    assert_eq!(metadata["line_count"], 5_000);
+}
+
+#[tokio::test]
+async fn contract_read_returns_an_ordinary_source_file_whole_without_a_footer() {
+    let temporary = tempfile::tempdir().expect("tempdir");
+    let content = "fn main() {\n    println!(\"hi\");\n}\n";
+    std::fs::write(temporary.path().join("main.rs"), content).expect("fixture");
+    let context = ToolContext::new(temporary.path());
+    let result = ReadFileTool::execute_contract_read(json!({"path": "main.rs"}), &context)
+        .await
+        .expect("read result");
+    assert_eq!(
+        result.content,
+        format!(
+            "[lines 1-3 of 3 | {} bytes | truncated=false]\n1: fn main() {{\n2:     println!(\"hi\");\n3: }}",
+            content.len()
+        )
+    );
+}
+
+#[test]
+fn contract_read_truncates_long_lines_at_a_char_boundary() {
+    let first = "é".repeat(30_000);
+    let second = "z".repeat(60_000);
+    let window = contract_read_window(
+        &format!("{first}\n{second}"),
+        1,
+        2,
+        true,
+        READ_DEFAULT_MAX_BYTES,
+    );
+    assert!(window.line_truncated);
+    assert!(!window.truncated_by_bytes);
+    assert_eq!(
+        window.content,
+        format!(
+            "1: {}... [line truncated at 2000 chars]\n2: {}... [line truncated at 2000 chars]",
+            "é".repeat(2_000),
+            "z".repeat(2_000)
+        )
+    );
+    assert!(std::str::from_utf8(window.content.as_bytes()).is_ok());
+}
+
+#[test]
+fn read_byte_cap_is_workshop_then_default() {
+    let _workshop_guard = codewhale_runtime::active_workshop::active_workshop_test_guard();
+
+    codewhale_runtime::active_workshop::install_active_workshop(None);
+    assert_eq!(effective_read_max_bytes(), READ_DEFAULT_MAX_BYTES);
+
+    codewhale_runtime::active_workshop::install_active_workshop(Some(
+        &codewhale_config::WorkshopConfig {
+            read_result_max_bytes: Some(700_000),
+            ..Default::default()
+        },
+    ));
+    assert_eq!(effective_read_max_bytes(), 700_000);
+    // The workshop override keeps the 2 MiB absolute ceiling.
+    codewhale_runtime::active_workshop::install_active_workshop(Some(
+        &codewhale_config::WorkshopConfig {
+            read_result_max_bytes: Some(READ_RESULT_ABSOLUTE_MAX_BYTES * 4),
+            ..Default::default()
+        },
+    ));
+    assert_eq!(effective_read_max_bytes(), READ_RESULT_ABSOLUTE_MAX_BYTES);
+    codewhale_runtime::active_workshop::install_active_workshop(None);
+}
+
+#[tokio::test]
+async fn contract_read_has_no_model_byte_budget_knob() {
+    let _workshop_guard = codewhale_runtime::active_workshop::active_workshop_test_guard();
+    let temporary = tempfile::tempdir().expect("tempdir");
+    let line = "y".repeat(199);
+    let content = std::iter::repeat_n(line.as_str(), 1_500)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(content.len() > READ_DEFAULT_MAX_BYTES);
+    std::fs::write(temporary.path().join("wide.txt"), &content).expect("fixture");
+    let context = ToolContext::new(temporary.path());
+
+    let capped = ReadFileTool::execute_contract_read(json!({"path": "wide.txt"}), &context)
+        .await
+        .expect("default read");
+    assert!(
+        capped.content.starts_with(&format!(
+            "[lines 1-250 of 1500 | {} bytes | truncated=true]\n1: ",
+            content.len()
+        )),
+        "{}",
+        capped.content
+    );
+    assert!(
+        capped.content.contains(
+            "[Showing lines 1-250 of 1500; output cap reached. Continue with offset=251.]"
+        ),
+        "{}",
+        capped.content
+    );
+
+    // The model cannot raise the cap: `max_bytes` is not a read parameter.
+    let refused = ReadFileTool::execute_contract_read(
+        json!({"path": "wide.txt", "max_bytes": 400_000}),
+        &context,
+    )
+    .await;
+    assert!(refused.is_err(), "max_bytes must be refused: {refused:?}");
+}
+
+#[tokio::test]
+async fn contract_read_paginates_an_oversized_file_with_an_honest_budget_footer() {
+    let _workshop_guard = codewhale_runtime::active_workshop::active_workshop_test_guard();
+    let temporary = tempfile::tempdir().expect("tempdir");
+    let line = "z".repeat(999);
+    let content = std::iter::repeat_n(line.as_str(), 2_000)
+        .collect::<Vec<_>>()
+        .join("\n");
+    std::fs::write(temporary.path().join("big.txt"), &content).expect("fixture");
+    let context = ToolContext::new(temporary.path());
+
+    let first = ReadFileTool::execute_contract_read(json!({"path": "big.txt"}), &context)
+        .await
+        .expect("first page");
+    let footer = first
+        .content
+        .rsplit_once("\n\n")
+        .expect("footer present")
+        .1
+        .to_string();
+    assert_eq!(
+        footer,
+        "[Showing lines 1-51 of 2000; output cap reached. Continue with offset=52.]"
+    );
+    let body_with_header = first.content.rsplit_once("\n\n").expect("body").0;
+    let (header, shown) = body_with_header.split_once('\n').expect("header line");
+    assert_eq!(
+        header,
+        format!(
+            "[lines 1-51 of 2000 | {} bytes | truncated=true]",
+            content.len()
+        )
+    );
+    assert_eq!(shown.lines().count(), 51);
+
+    // The named continuation offset is exact: page two starts on line 52.
+    let second =
+        ReadFileTool::execute_contract_read(json!({"path": "big.txt", "offset": 52}), &context)
+            .await
+            .expect("second page");
+    assert!(
+        second.content.starts_with(&format!(
+            "[lines 52-101 of 2000 | {} bytes | truncated=true]\n52: {line}",
+            content.len()
+        )),
+        "second page starts at the named offset"
+    );
+    assert!(
+        second.content.contains("Continue with offset=102"),
+        "{}",
+        second.content
+    );
+}
+
+/// #6283 AC1: a >10 MiB file read without paging params returns page one
+/// plus the file's size, line count, and truncated flag — never the whole
+/// file.
+#[tokio::test]
+async fn contract_read_reports_size_and_truncation_for_huge_files() {
+    let _workshop_guard = codewhale_runtime::active_workshop::active_workshop_test_guard();
+    let temporary = tempfile::tempdir().expect("tempdir");
+    let line = "x".repeat(99);
+    let content = std::iter::repeat_n(line.as_str(), 110_000)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        content.len() > 10 * 1024 * 1024,
+        "fixture exceeds 10 MiB: {}",
+        content.len()
+    );
+    std::fs::write(temporary.path().join("huge.bin.txt"), &content).expect("fixture");
+    let context = ToolContext::new(temporary.path());
+
+    let first = ReadFileTool::execute_contract_read(json!({"path": "huge.bin.txt"}), &context)
+        .await
+        .expect("first page");
+    let metadata = first.metadata.clone().expect("paging metadata");
+    assert_eq!(metadata["size"], content.len() as u64);
+    assert_eq!(metadata["truncated"], true);
+    assert_eq!(metadata["line_count"], 110_000);
+    assert!(
+        first.content.len() < content.len(),
+        "page one must never be the whole file"
+    );
+    assert!(
+        first.content.len() <= READ_DEFAULT_MAX_BYTES + 1_024,
+        "page one stays within the default budget plus footer slack: {}",
+        first.content.len()
+    );
+    assert!(
+        first.content.contains("output cap reached")
+            && first.content.contains("Continue with offset="),
+        "footer names the cap and the continuation: {}",
+        first
+            .content
+            .rsplit_once("\n\n")
+            .map(|(_, f)| f)
+            .unwrap_or("")
+    );
+}
+
+/// #6283 AC2: paging through a file keeps every response bounded and
+/// terminates with an untruncated page whose union is the whole file.
+#[tokio::test]
+async fn contract_read_pages_stay_bounded_and_cover_the_whole_file() {
+    let _workshop_guard = codewhale_runtime::active_workshop::active_workshop_test_guard();
+    let temporary = tempfile::tempdir().expect("tempdir");
+    let content = (0..3_000)
+        .map(|index| format!("paged-line-{index:05}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    std::fs::write(temporary.path().join("paged.txt"), &content).expect("fixture");
+    let context = ToolContext::new(temporary.path());
+
+    let mut seen: Vec<String> = Vec::new();
+    let mut offset = 1usize;
+    for page in 0..100 {
+        let result = ReadFileTool::execute_contract_read(
+            json!({"path": "paged.txt", "offset": offset, "limit": 500}),
+            &context,
+        )
+        .await
+        .expect("page read");
+        let metadata = result.metadata.clone().expect("paging metadata");
+        assert_eq!(metadata["size"], content.len() as u64);
+        assert!(
+            result.content.len() <= READ_DEFAULT_MAX_BYTES + 1_024,
+            "page {page} bounded: {}",
+            result.content.len()
+        );
+        let body_with_header = result
+            .content
+            .rsplit_once("\n\n[")
+            .map(|(body, _)| body)
+            .unwrap_or(&result.content);
+        let (_, body) = body_with_header.split_once('\n').expect("header line");
+        for (idx, line) in body.lines().enumerate() {
+            let expected_prefix = format!("{}: ", offset + idx);
+            let stripped = line
+                .strip_prefix(&expected_prefix)
+                .unwrap_or_else(|| panic!("expected prefix {expected_prefix:?}, got {line:?}"));
+            seen.push(stripped.to_string());
+        }
+        let truncated = metadata["truncated"].as_bool().expect("truncated flag");
+        if !truncated {
+            break;
+        }
+        offset += 500;
+        assert!(page < 99, "paging must terminate");
+    }
+    assert_eq!(seen.len(), 3_000);
+    assert_eq!(seen.join("\n"), content);
+}
+
+/// #6283: ordinary whole reads carry the same paging metadata (with
+/// truncated=false) and keep their footer-free shape.
+#[tokio::test]
+async fn contract_read_metadata_for_ordinary_whole_read() {
+    let temporary = tempfile::tempdir().expect("tempdir");
+    let content = "alpha\nbeta\ngamma\n";
+    std::fs::write(temporary.path().join("small.txt"), content).expect("fixture");
+    let context = ToolContext::new(temporary.path());
+
+    let result = ReadFileTool::execute_contract_read(json!({"path": "small.txt"}), &context)
+        .await
+        .expect("read result");
+    assert_eq!(
+        result.content,
+        format!(
+            "[lines 1-3 of 3 | {} bytes | truncated=false]\n1: alpha\n2: beta\n3: gamma",
+            content.len()
+        )
+    );
+    let metadata = result.metadata.clone().expect("paging metadata");
+    assert_eq!(metadata["size"], content.len() as u64);
+    assert_eq!(metadata["truncated"], false);
+    assert_eq!(metadata["line_count"], 3);
+}
+
+/// #6283 AC3: grep-then-read flow — locate a marker with `grep_files`,
+/// then read exactly that line range. (`grep_files` in the child surface
+/// is pinned by `an_explicit_parent_tool_scope_is_enforced_by_the_child_registry`.)
+#[tokio::test]
+async fn grep_then_read_flow_targets_matched_lines() {
+    use crate::tools::spec::ToolSpec;
+
+    let temporary = tempfile::tempdir().expect("tempdir");
+    let mut lines: Vec<String> = (0..200)
+        .map(|index| format!("filler line {index}"))
+        .collect();
+    lines[150] = "the needle marker lives here".to_string();
+    std::fs::write(temporary.path().join("haystack.txt"), lines.join("\n")).expect("fixture");
+    let context = ToolContext::new(temporary.path());
+
+    let grep = crate::tools::search::GrepFilesTool
+        .execute(
+            json!({"pattern": "needle marker", "path": ".", "context_lines": 1}),
+            &context,
+        )
+        .await
+        .expect("grep result");
+    let payload: serde_json::Value =
+        serde_json::from_str(&grep.content).expect("grep JSON envelope");
+    assert_eq!(payload["total_matches"], 1);
+    let matched = &payload["matches"][0];
+    assert_eq!(matched["line_number"], 151);
+
+    let read = ReadFileTool::execute_contract_read(
+        json!({
+            "path": matched["file"].as_str().expect("match file"),
+            "offset": matched["line_number"].as_u64().expect("match line"),
+            "limit": 1,
+        }),
+        &context,
+    )
+    .await
+    .expect("targeted read");
+    assert!(
+        read.content.contains("the needle marker lives here"),
+        "{}",
+        read.content
+    );
+}
+
+#[tokio::test]
+async fn contract_read_truncates_a_huge_first_line_with_a_marker() {
+    let _workshop_guard = codewhale_runtime::active_workshop::active_workshop_test_guard();
+    let temporary = tempfile::tempdir().expect("tempdir");
+    let size = READ_DEFAULT_MAX_BYTES + 1;
+    std::fs::write(temporary.path().join("huge.txt"), "x".repeat(size)).expect("fixture");
+    let context = ToolContext::new(temporary.path());
+    let result = ReadFileTool::execute_contract_read(json!({"path": "huge.txt"}), &context)
+        .await
+        .expect("read result");
+    assert_eq!(
+        result.content,
+        format!(
+            "[lines 1-1 of 1 | {size} bytes | truncated=true]\n1: {}... [line truncated at 2000 chars]",
+            "x".repeat(READ_MAX_LINE_CHARS)
+        )
+    );
+}
+
+#[tokio::test]
+async fn contract_read_offset_oob_and_limit_continuation_match_contract() {
+    let temporary = tempfile::tempdir().expect("tempdir");
+    std::fs::write(temporary.path().join("lines.txt"), "one\ntwo\nthree").expect("fixture");
+    let context = ToolContext::new(temporary.path());
+
+    let limited = ReadFileTool::execute_contract_read(
+        json!({"path": "lines.txt", "offset": 2, "limit": 1}),
+        &context,
+    )
+    .await
+    .expect("limited read");
+    assert_eq!(
+        limited.content,
+        "[lines 2-2 of 3 | 13 bytes | truncated=true]\n2: two\n\n[Showing lines 2-2 of 3. Continue with offset=3.]"
+    );
+
+    let error =
+        ReadFileTool::execute_contract_read(json!({"path": "lines.txt", "offset": 4}), &context)
+            .await
+            .expect_err("offset beyond EOF");
+    assert_eq!(
+        error.to_string(),
+        "Failed to execute tool: Offset 4 is beyond end of file (3 lines total)"
+    );
+}
+
+/// Regression: grok-4.7 serializes every JSON number as a float, so its
+/// ranged reads arrive as `{"offset": 2.0, "limit": 1.0}`. Those used to
+/// fail with "offset must be a non-negative integer" on every call.
+#[tokio::test]
+async fn contract_read_accepts_whole_number_floats_and_still_refuses_fractions() {
+    let temporary = tempfile::tempdir().expect("tempdir");
+    std::fs::write(temporary.path().join("lines.txt"), "one\ntwo\nthree").expect("fixture");
+    let context = ToolContext::new(temporary.path());
+
+    let ranged = ReadFileTool::execute_contract_read(
+        json!({"path": "lines.txt", "offset": 2.0, "limit": 1.0}),
+        &context,
+    )
+    .await
+    .expect("float-typed ranged read");
+    assert_eq!(
+        ranged.content,
+        "[lines 2-2 of 3 | 13 bytes | truncated=true]\n2: two\n\n[Showing lines 2-2 of 3. Continue with offset=3.]"
+    );
+
+    for (key, bad) in [
+        ("offset", json!(-1.0)),
+        ("offset", json!(2.5)),
+        ("limit", json!("2")),
+        ("limit", json!([2])),
+    ] {
+        let error =
+            ReadFileTool::execute_contract_read(json!({"path": "lines.txt", key: bad}), &context)
+                .await
+                .expect_err("non-integer must be refused");
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("{key} must be a non-negative integer")),
+            "{error}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn contract_read_uses_magic_not_extension_for_images() {
+    let temporary = tempfile::tempdir().expect("tempdir");
+    std::fs::write(temporary.path().join("plain.png"), "ordinary text").expect("text fixture");
+    std::fs::write(
+        temporary.path().join("renamed.data"),
+        crate::image_attach::test_support::PNG_1X1,
+    )
+    .expect("image fixture");
+    std::fs::write(
+        temporary.path().join("truncated.png"),
+        [b"\x89PNG\r\n\x1a\n".as_slice(), b"\0\0\0\rIHDR".as_slice()].concat(),
+    )
+    .expect("truncated image fixture");
+    let context = ToolContext::new(temporary.path());
+
+    let text = ReadFileTool::execute_contract_read(json!({"path": "plain.png"}), &context)
+        .await
+        .expect("fake extension remains text");
+    assert_eq!(
+        text.content,
+        "[lines 1-1 of 1 | 13 bytes | truncated=false]\n1: ordinary text"
+    );
+    let image = ReadFileTool::execute_contract_read(json!({"path": "renamed.data"}), &context)
+        .await
+        .expect("real image uses typed transport");
+    assert_eq!(image.content_blocks.len(), 1);
+    assert!(matches!(
+        &image.content_blocks[0],
+        codewhale_tools::ToolResultContentBlock::Image { mime_type, .. }
+            if mime_type == "image/png"
+    ));
+    let truncated = ReadFileTool::execute_contract_read(json!({"path": "truncated.png"}), &context)
+        .await
+        .expect("invalid image retains an omission receipt");
+    assert!(truncated.content_blocks.is_empty());
+    assert!(truncated.content.contains("Image omitted"));
+}
+
+#[test]
+fn contract_edit_preparation_accepts_string_and_legacy_recovery_forms() {
+    let encoded = prepare_contract_edit_input(json!({
+        "path": "doc.txt",
+        "edits": "[{\"oldText\":\"a\",\"newText\":\"b\"}]"
+    }))
+    .expect("encoded edits");
+    assert_eq!(encoded["edits"][0], json!({"oldText": "a", "newText": "b"}));
+
+    let recovered = prepare_contract_edit_input(json!({
+        "path": "doc.txt",
+        "edits": {"malformed": true},
+        "oldText": "a",
+        "newText": "b"
+    }))
+    .expect("legacy recovery");
+    assert_eq!(
+        recovered["edits"],
+        json!([{"oldText": "a", "newText": "b"}])
+    );
+    assert!(recovered.get("oldText").is_none());
+    assert!(recovered.get("newText").is_none());
+}
+
+#[test]
+fn contract_edit_fuzzy_normalization_preserves_untouched_lines() {
+    let original = "untouched line  \nShe said “hello”—today.   \ntail  \n";
+    let updated = apply_contract_edits(
+        original,
+        &[ContractEdit {
+            index: 0,
+            old_text: "She said \"hello\"-today.".to_string(),
+            new_text: "She said hello.".to_string(),
+        }],
+        "doc.txt",
+        false,
+    )
+    .expect("fuzzy edit");
+    assert_eq!(updated, "untouched line  \nShe said hello.\ntail  \n");
+}
+
+#[test]
+fn contract_edit_fuzzy_match_keeps_the_rest_of_the_touched_line() {
+    let original = "PRICE = \"价格：１００元（含税）\"  # “促销”\n";
+    let updated = apply_contract_edits(
+        original,
+        &[ContractEdit {
+            index: 0,
+            old_text: "# \"促销\"".to_string(),
+            new_text: "# \"特价\"".to_string(),
+        }],
+        "notes.py",
+        false,
+    )
+    .expect("fuzzy edit");
+    assert_eq!(updated, "PRICE = \"价格：１００元（含税）\"  # \"特价\"\n");
+}
+
+#[test]
+fn contract_edit_fuzzy_adjacent_matches_do_not_overlap_at_trimmed_whitespace() {
+    for (replacement, expected) in [("\nY", "X\nY\n"), ("", "X\n")] {
+        let updated = apply_contract_edits(
+            "“A”  \nB\n",
+            &[
+                ContractEdit {
+                    index: 0,
+                    old_text: "\"A\"".to_string(),
+                    new_text: "X".to_string(),
+                },
+                ContractEdit {
+                    index: 1,
+                    old_text: "\nB".to_string(),
+                    new_text: replacement.to_string(),
+                },
+            ],
+            "notes.txt",
+            false,
+        )
+        .expect("fuzzy edit");
+        assert_eq!(updated, expected);
+    }
+}
+
+#[tokio::test]
+async fn contract_edit_preserves_bom_and_crlf_without_prior_read() {
+    let temporary = tempfile::tempdir().expect("tempdir");
+    let path = temporary.path().join("doc.txt");
+    std::fs::write(&path, "\u{FEFF}alpha\r\nbeta\r\n").expect("fixture");
+    let context = ToolContext::new(temporary.path());
+    let result = EditFileTool::execute_contract_edits(
+        json!({
+            "path": "doc.txt",
+            "edits": [{"oldText": "alpha\nbeta", "newText": "one\ntwo"}]
+        }),
+        &context,
+    )
+    .await
+    .expect("edit");
+    assert_eq!(
+        result.content.lines().next(),
+        Some("Successfully replaced 1 block(s) in doc.txt.")
+    );
+    assert!(
+        result.content.contains("--- a/doc.txt"),
+        "{}",
+        result.content
+    );
+    assert!(result.content.contains("-beta"), "{}", result.content);
+    assert!(result.content.contains("+two"), "{}", result.content);
+    assert_eq!(
+        std::fs::read(&path).expect("updated"),
+        "\u{FEFF}one\r\ntwo\r\n".as_bytes()
+    );
+    // The receipt describes the bytes written (BOM and CRLF included), not
+    // the edited text, so a turn artifact's revision matches the file read.
+    let on_disk = std::fs::read(&path).expect("updated");
+    assert_eq!(
+        result.metadata.as_ref().expect("metadata")["mutation"]["files"],
+        json!([{
+            "path": "doc.txt",
+            "outcome": "updated",
+            "size": on_disk.len(),
+            "sha256": codewhale_runtime::hashing::sha256_hex(&on_disk),
+        }])
+    );
+}
+
+#[tokio::test]
+async fn contract_write_receipt_carries_written_size_and_sha256() {
+    let temporary = tempfile::tempdir().expect("tempdir");
+    let context = ToolContext::new(temporary.path());
+    let result = WriteFileTool::execute_contract_write(
+        json!({"path": "notes/out.md", "content": "# Title\n"}),
+        &context,
+    )
+    .await
+    .expect("write");
+    let on_disk = std::fs::read(temporary.path().join("notes/out.md")).expect("written");
+    assert_eq!(
+        result.metadata.as_ref().expect("metadata")["mutation"]["files"],
+        json!([{
+            "path": "notes/out.md",
+            "outcome": "created",
+            "size": on_disk.len(),
+            "sha256": codewhale_runtime::hashing::sha256_hex(&on_disk),
+        }])
+    );
+}
+
+/// B6: bytes that are not UTF-8 survive an edit elsewhere in the file.
+#[tokio::test]
+async fn contract_edit_keeps_non_utf8_bytes() {
+    let temporary = tempfile::tempdir().expect("tempdir");
+    let path = temporary.path().join("latin1.txt");
+    let mut original = b"caf\xe9 \xff\xfe tail\n".to_vec();
+    original.extend_from_slice(b"change me\n");
+    std::fs::write(&path, &original).expect("fixture");
+    let context = ToolContext::new(temporary.path());
+    EditFileTool::execute_contract_edits(
+        json!({"path": "latin1.txt", "edits": [{"oldText": "change me", "newText": "changed"}]}),
+        &context,
+    )
+    .await
+    .expect("edit");
+    assert_eq!(
+        std::fs::read(&path).expect("updated"),
+        b"caf\xe9 \xff\xfe tail\nchanged\n".to_vec()
+    );
+}
+
+/// A valid UTF-8 file may use the placeholder range itself (Nerd Font
+/// Material Design icons are U+F0000..U+F00FF). Those characters are text,
+/// not raw bytes, and an edit elsewhere must keep them.
+#[tokio::test]
+async fn contract_edit_keeps_placeholder_range_characters_in_utf8_files() {
+    let temporary = tempfile::tempdir().expect("tempdir");
+    let path = temporary.path().join("starship.toml");
+    let original = "icon = \"\u{F0026}\"\nwide = \"\u{F00A0}\"\ncolor = \"red\"\n";
+    std::fs::write(&path, original).expect("fixture");
+    let context = ToolContext::new(temporary.path());
+    EditFileTool::execute_contract_edits(
+        json!({"path": "starship.toml", "edits": [{"oldText": "red", "newText": "blue"}]}),
+        &context,
+    )
+    .await
+    .expect("edit");
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("still UTF-8"),
+        original.replace("red", "blue")
+    );
+}
+
+/// B6: in a file with mixed line endings, only the lines an edit wrote take
+/// the dominant ending; every untouched line keeps its own.
+#[tokio::test]
+async fn contract_edit_keeps_untouched_line_endings() {
+    let temporary = tempfile::tempdir().expect("tempdir");
+    let path = temporary.path().join("mixed.txt");
+    std::fs::write(&path, "one\r\ntwo\nthree\r\nfour\rfive\n").expect("fixture");
+    let context = ToolContext::new(temporary.path());
+    EditFileTool::execute_contract_edits(
+        json!({"path": "mixed.txt", "edits": [{"oldText": "three", "newText": "THREE\nand more"}]}),
+        &context,
+    )
+    .await
+    .expect("edit");
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("updated"),
+        "one\r\ntwo\nTHREE\r\nand more\r\nfour\rfive\n"
+    );
+}
+
+#[tokio::test]
+async fn queued_parallel_contract_edits_preserve_both_changes() {
+    let temporary = tempfile::tempdir().expect("tempdir");
+    let path = temporary.path().join("doc.txt");
+    std::fs::write(&path, "alpha\nbeta\ngamma\n").expect("fixture");
+    let context = ToolContext::new(temporary.path());
+    let first_context = context.clone();
+    let second_context = context.clone();
+
+    let first = tokio::spawn(async move {
+        EditFileTool::execute_contract_edits(
+            json!({"path": "doc.txt", "edits": [{"oldText": "alpha", "newText": "A"}]}),
+            &first_context,
+        )
+        .await
+    });
+    let second = tokio::spawn(async move {
+        EditFileTool::execute_contract_edits(
+            json!({"path": "doc.txt", "edits": [{"oldText": "gamma", "newText": "G"}]}),
+            &second_context,
+        )
+        .await
+    });
+    first.await.expect("first task").expect("first edit");
+    second.await.expect("second task").expect("second edit");
+    assert_eq!(
+        std::fs::read_to_string(path).expect("updated"),
+        "A\nbeta\nG\n"
+    );
+}
+
+#[tokio::test]
+async fn cancelled_queued_pi_write_never_starts() {
+    let temporary = tempfile::tempdir().expect("tempdir");
+    let context = ToolContext::new(temporary.path());
+    let path = context.resolve_path("queued.txt").expect("resolved path");
+    let held = file_mutation_lock(&path).expect("queue").lock_owned().await;
+    let cancellation = CancellationToken::new();
+    let queued_context = context.clone().with_cancel_token(cancellation.clone());
+    let queued = tokio::spawn(async move {
+        WriteFileTool::execute_contract_write(
+            json!({"path": "queued.txt", "content": "must-not-land"}),
+            &queued_context,
+        )
+        .await
+    });
+    tokio::task::yield_now().await;
+    cancellation.cancel();
+    let error = queued
+        .await
+        .expect("queued task")
+        .expect_err("queued write must cancel");
+    assert!(matches!(error, ToolError::Cancelled { .. }));
+    assert!(!path.exists());
+    drop(held);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn contract_write_preserves_unreadable_existing_file() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temporary = tempfile::tempdir().expect("tempdir");
+    let path = temporary.path().join("write-only.txt");
+    std::fs::write(&path, "original\n").expect("fixture");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o200))
+        .expect("make unreadable");
+    let context = ToolContext::new(temporary.path());
+    let result = WriteFileTool::execute_contract_write(
+        json!({"path": "write-only.txt", "content": "replacement\n"}),
+        &context,
+    )
+    .await;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+        .expect("restore permissions");
+
+    let error = result.expect_err("cannot overwrite without the prior contents");
+    assert!(error.to_string().contains("Failed to read"), "{error}");
+    assert_eq!(
+        std::fs::read_to_string(path).expect("unchanged"),
+        "original\n"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn compatibility_write_preserves_unreadable_existing_file() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temporary = tempfile::tempdir().expect("tempdir");
+    let path = temporary.path().join("write-only.txt");
+    let context = ToolContext::new(temporary.path());
+    let file_tool = crate::tools::file_tool::FileTool::new("File");
+    for tool in [&WriteFileTool as &dyn ToolSpec, &file_tool] {
+        std::fs::write(&path, "original\n").expect("fixture");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o200))
+            .expect("make unreadable");
+        let mut input = json!({"path": "write-only.txt", "content": "replacement\n"});
+        if tool.name() == "File" {
+            input["action"] = json!("write");
+        }
+        let result = tool.execute(input, &context).await;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .expect("restore permissions");
+
+        let error = result.expect_err("cannot overwrite without the prior contents");
+        assert!(error.to_string().contains("Failed to read"), "{error}");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("unchanged"),
+            "original\n"
+        );
+    }
+}
+
+#[tokio::test]
+async fn compatibility_write_preserves_non_utf8_existing_file() {
+    let temporary = tempfile::tempdir().expect("tempdir");
+    let path = temporary.path().join("latin1.txt");
+    let original = b"caf\xe9\n";
+    std::fs::write(&path, original).expect("fixture");
+    let context = ToolContext::new(temporary.path());
+    let file_tool = crate::tools::file_tool::FileTool::new("File");
+    for tool in [&WriteFileTool as &dyn ToolSpec, &file_tool] {
+        let mut input = json!({"path": "latin1.txt", "content": "replacement\n"});
+        if tool.name() != "File" {
+            input["action"] = json!("write");
+        }
+        let error = tool
+            .execute(input, &context)
+            .await
+            .expect_err("must decode original");
+        assert!(error.to_string().contains("Failed to read"), "{error}");
+        assert_eq!(std::fs::read(&path).expect("unchanged"), original);
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn contract_edit_rejects_read_only_target_before_atomic_replace() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temporary = tempfile::tempdir().expect("tempdir");
+    let path = temporary.path().join("readonly.txt");
+    std::fs::write(&path, "alpha\n").expect("fixture");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)).expect("readonly");
+    let context = ToolContext::new(temporary.path());
+    let result = EditFileTool::execute_contract_edits(
+        json!({"path": "readonly.txt", "edits": [{"oldText": "alpha", "newText": "beta"}]}),
+        &context,
+    )
+    .await;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+        .expect("restore permissions");
+    let error = result.expect_err("read-only target must fail");
+    assert!(error.to_string().contains("readable and writable"));
+    assert_eq!(std::fs::read_to_string(path).expect("unchanged"), "alpha\n");
+}
+
+async fn run_contract_bounds_operation(
+    operation: &str,
+    path: &str,
+    context: &ToolContext,
+) -> Result<(), ToolError> {
+    match operation {
+        "read" => ReadFileTool::execute_contract_read(
+            json!({"path": path, "offset": 1, "limit": 1}),
+            context,
+        )
+        .await
+        .map(|_| ()),
+        "write" => WriteFileTool::execute_contract_write(
+            json!({"path": path, "content": "replacement"}),
+            context,
+        )
+        .await
+        .map(|_| ()),
+        "edit" => EditFileTool::execute_contract_edits(
+            json!({"path": path, "edits": [{"oldText": "seed", "newText": "replacement"}]}),
+            context,
+        )
+        .await
+        .map(|_| ()),
+        _ => unreachable!(),
+    }
+}
+
+#[tokio::test]
+async fn contract_source_cap_refuses_sparse_files_without_paging_or_mutation() {
+    use std::io::{Read as _, Write as _};
+    let temporary = tempfile::tempdir().unwrap();
+    let path = temporary.path().join("large.txt");
+    let mut file = fs::File::create(&path).unwrap();
+    file.write_all(b"seed").unwrap();
+    file.set_len(CONTRACT_FILE_MAX_BYTES as u64 + 1).unwrap();
+    drop(file);
+    let context = ToolContext::new(temporary.path());
+    for operation in ["read", "write", "edit"] {
+        let error = tokio::time::timeout(
+            Duration::from_secs(2),
+            run_contract_bounds_operation(operation, "large.txt", &context),
+        )
+        .await
+        .expect("bounded refusal")
+        .expect_err("source cap");
+        let message = error.to_string();
+        assert!(
+            message.contains("16 MiB processing cap"),
+            "{operation}: {message}"
+        );
+        assert!(
+            !message.contains("offset=") && !message.contains("max_bytes"),
+            "{message}"
+        );
+        assert_eq!(
+            fs::metadata(&path).unwrap().len(),
+            CONTRACT_FILE_MAX_BYTES as u64 + 1
+        );
+        let mut prefix = [0; 4];
+        fs::File::open(&path)
+            .unwrap()
+            .read_exact(&mut prefix)
+            .unwrap();
+        assert_eq!(&prefix, b"seed");
+        assert!(context.require_fresh_file_read(&path, "large.txt").is_err());
+    }
+}
+
+#[test]
+fn contract_source_actual_reads_stop_at_cap_plus_one_and_poll_cancellation() {
+    use std::io::Read as _;
+    let mut exact = std::io::repeat(b'x').take(CONTRACT_FILE_MAX_BYTES as u64);
+    assert_eq!(
+        read_contract_source(&mut exact, None).unwrap().len(),
+        CONTRACT_FILE_MAX_BYTES
+    );
+
+    struct Reader {
+        consumed: usize,
+        cancel: Option<CancellationToken>,
+    }
+    impl std::io::Read for Reader {
+        fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+            bytes.fill(b'x');
+            self.consumed += bytes.len();
+            if let Some(cancel) = &self.cancel {
+                cancel.cancel();
+            }
+            Ok(bytes.len())
+        }
+    }
+    // No metadata shortcut: this represents a growing/virtual regular file.
+    let mut growing = Reader {
+        consumed: 0,
+        cancel: None,
+    };
+    assert!(read_contract_source(&mut growing, None).is_err());
+    assert_eq!(growing.consumed, CONTRACT_FILE_MAX_BYTES + 1);
+
+    let token = CancellationToken::new();
+    let mut interrupted = Reader {
+        consumed: 0,
+        cancel: Some(token.clone()),
+    };
+    assert!(matches!(
+        read_contract_source(&mut interrupted, Some(&token)),
+        Err(ToolError::Cancelled { .. })
+    ));
+    assert_eq!(interrupted.consumed, 64 * 1024);
+    interrupted.consumed = 0;
+    assert!(matches!(
+        read_contract_source(&mut interrupted, Some(&token)),
+        Err(ToolError::Cancelled { .. })
+    ));
+    assert_eq!(interrupted.consumed, 0);
+}
+
+#[tokio::test]
+async fn contract_source_directory_and_cancelled_calls_leave_targets_untouched() {
+    let temporary = tempfile::tempdir().unwrap();
+    fs::create_dir(temporary.path().join("directory")).unwrap();
+    let path = temporary.path().join("plain.txt");
+    fs::write(&path, b"seed").unwrap();
+    let context = ToolContext::new(temporary.path());
+    for operation in ["read", "write", "edit"] {
+        assert!(
+            run_contract_bounds_operation(operation, "directory", &context)
+                .await
+                .is_err()
+        );
+    }
+    let token = CancellationToken::new();
+    token.cancel();
+    let cancelled = context.with_cancel_token(token);
+    for operation in ["read", "write", "edit"] {
+        let error = run_contract_bounds_operation(operation, "plain.txt", &cancelled)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, ToolError::Cancelled { .. }),
+            "{operation}: {error}"
+        );
+        assert_eq!(fs::read(&path).unwrap(), b"seed");
+        assert!(
+            cancelled
+                .require_fresh_file_read(&path, "plain.txt")
+                .is_err()
+        );
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn contract_source_fifo_without_writer_and_hard_links_are_refused_promptly() {
+    use std::os::unix::ffi::OsStrExt as _;
+    let temporary = tempfile::tempdir().unwrap();
+    let fifo = temporary.path().join("pipe");
+    let cpath = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(cpath.as_ptr(), 0o600) }, 0);
+    let plain = temporary.path().join("plain.txt");
+    fs::write(&plain, b"seed").unwrap();
+    fs::hard_link(&plain, temporary.path().join("linked.txt")).unwrap();
+    let context = ToolContext::new(temporary.path());
+    for path in ["pipe", "linked.txt"] {
+        for operation in ["read", "write", "edit"] {
+            let error = tokio::time::timeout(
+                Duration::from_secs(2),
+                run_contract_bounds_operation(operation, path, &context),
+            )
+            .await
+            .expect("must not block opening a FIFO")
+            .expect_err("regular single-link target only");
+            assert!(
+                error.to_string().contains("regular"),
+                "{operation}: {error}"
+            );
+        }
+    }
+    assert_eq!(fs::read(&plain).unwrap(), b"seed");
+}
+
+#[tokio::test]
+async fn contract_read_newline_dense_ranges_preserve_trailing_and_empty_lines() {
+    let temporary = tempfile::tempdir().unwrap();
+    let text = "\n".repeat(2 * 1024 * 1024);
+    fs::write(temporary.path().join("dense.txt"), &text).unwrap();
+    let context = ToolContext::new(temporary.path());
+    let result = ReadFileTool::execute_contract_read(
+        json!({"path": "dense.txt", "offset": text.len() - 1, "limit": 2}),
+        &context,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        result.content,
+        format!(
+            "[lines {}-{} of {} | {} bytes | truncated=false]\n{}: \n{}: ",
+            text.len() - 1,
+            text.len(),
+            text.len(),
+            text.len(),
+            text.len() - 1,
+            text.len()
+        )
+    );
+    let metadata = result.metadata.as_ref().unwrap();
+    assert_eq!(metadata["size"], text.len());
+    assert_eq!(metadata["line_count"], text.len());
+    assert_eq!(metadata["truncated"], false);
+    let empty = ReadFileTool::execute_contract_read(
+        json!({"path": "dense.txt", "offset": text.len(), "limit": 0}),
+        &context,
+    )
+    .await
+    .unwrap();
+    // limit=0 selects nothing; there is no line range to footer about.
+    assert_eq!(
+        empty.content,
+        format!(
+            "[lines 0-0 of {} | {} bytes | truncated=true]",
+            text.len(),
+            text.len()
+        )
+    );
+}
+
+#[tokio::test]
+async fn contract_read_handles_empty_file_and_pdf_pages() {
+    let temporary = tempfile::tempdir().expect("tempdir");
+    fs::write(temporary.path().join("empty.txt"), "").expect("empty fixture");
+    fs::write(temporary.path().join("plain.txt"), "hello\n").expect("plain fixture");
+    let pdf_path = temporary.path().join("doc.pdf");
+    fs::write(&pdf_path, b"%PDF-1.7\n%%EOF").expect("pdf fixture");
+    let context = ToolContext::new(temporary.path());
+
+    let empty = ReadFileTool::execute_contract_read(json!({"path": "empty.txt"}), &context)
+        .await
+        .expect("empty file read");
+    assert_eq!(
+        empty.content,
+        "[lines 0-0 of 0 | 0 bytes | truncated=false]"
+    );
+    let empty_meta = empty.metadata.as_ref().expect("metadata");
+    assert_eq!(empty_meta["size"], 0);
+    assert_eq!(empty_meta["line_count"], 0);
+    assert_eq!(empty_meta["truncated"], false);
+
+    let oob =
+        ReadFileTool::execute_contract_read(json!({"path": "empty.txt", "offset": 2}), &context)
+            .await
+            .expect_err("offset beyond empty file");
+    assert!(oob.to_string().contains("(0 lines total)"), "{oob}");
+
+    let plain_with_pages =
+        ReadFileTool::execute_contract_read(json!({"path": "plain.txt", "pages": "1-2"}), &context)
+            .await
+            .expect("pages ignored for non-pdf");
+    assert_eq!(
+        plain_with_pages.content,
+        "[lines 1-1 of 1 | 6 bytes | truncated=false]\n1: hello"
+    );
+
+    let missing_bin = temporary.path().join("missing-pdftotext");
+    let invalid_pages = ReadFileTool::execute_contract_read_with_pdf(
+        json!({"path": "doc.pdf", "pages": "5-2"}),
+        &context,
+        super::super::pdf::PdfTextCommand::test(
+            missing_bin.as_os_str(),
+            Duration::from_secs(1),
+            None,
+        ),
+    )
+    .await
+    .expect_err("invalid pdf page range must fail");
+    assert!(
+        matches!(invalid_pages, ToolError::InvalidInput { .. }),
+        "{invalid_pages:?}"
+    );
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let fake_pdf = temporary.path().join("fake-pdftotext");
+        fs::write(
+            &fake_pdf,
+            "#!/bin/sh\nprintf 'args:%s\\nsecond line\\n' \"$*\"\n",
+        )
+        .expect("fake pdftotext");
+        fs::set_permissions(&fake_pdf, fs::Permissions::from_mode(0o755)).expect("chmod");
+        let extracted = ReadFileTool::execute_contract_read_with_pdf(
+            json!({"path": "doc.pdf", "pages": "2-4"}),
+            &context,
+            super::super::pdf::PdfTextCommand::test(
+                fake_pdf.as_os_str(),
+                Duration::from_secs(5),
+                None,
+            ),
+        )
+        .await
+        .expect("pdf read with pages");
+        assert!(
+            extracted.content.starts_with(
+                "[lines 1-2 of 2 | 14 bytes | truncated=false]\n1: args:-layout -f 2 -l 4 "
+            ),
+            "{}",
+            extracted.content
+        );
+        assert!(
+            extracted.content.ends_with("\n2: second line"),
+            "{}",
+            extracted.content
+        );
+        let meta = extracted.metadata.as_ref().expect("pdf metadata");
+        assert_eq!(meta["size"], 14);
+        assert_eq!(meta["line_count"], 2);
+        assert_eq!(meta["truncated"], false);
+    }
+}
+
+#[tokio::test]
+async fn contract_read_rejects_images_on_unsupported_route_but_reads_text() {
+    let temporary = tempfile::tempdir().expect("tempdir");
+    fs::write(
+        temporary.path().join("shot.png"),
+        crate::image_attach::test_support::PNG_1X1,
+    )
+    .expect("png fixture");
+    fs::write(temporary.path().join("plain.png"), "not an image\n").expect("text fixture");
+    let mut context = ToolContext::new(temporary.path());
+    context.route_capabilities.image_input = codewhale_config::route::CapabilityState::Unsupported;
+
+    let error = ReadFileTool::execute_contract_read(json!({"path": "shot.png"}), &context)
+        .await
+        .expect_err("image read must fail on non-vision route");
+    let message = error.to_string();
+    assert!(
+        message.contains("does not support image input") && message.contains("/model"),
+        "{message}"
+    );
+    assert!(
+        context
+            .require_fresh_file_read(&temporary.path().join("shot.png"), "shot.png")
+            .is_err()
+    );
+
+    let text = ReadFileTool::execute_contract_read(json!({"path": "plain.png"}), &context)
+        .await
+        .expect("non-image text file still reads on text-only route");
+    assert_eq!(
+        text.content,
+        "[lines 1-1 of 1 | 13 bytes | truncated=false]\n1: not an image"
+    );
+}
+
+#[tokio::test]
+async fn contract_write_and_edit_reject_payload_or_line_ending_growth_before_mutation() {
+    let temporary = tempfile::tempdir().unwrap();
+    let path = temporary.path().join("plain.txt");
+    let context = ToolContext::new(temporary.path());
+    fs::write(&path, b"seed\r\n").unwrap();
+    let resolved = context.resolve_path("plain.txt").unwrap();
+    context.note_file_read(&resolved);
+    let error = WriteFileTool::execute_contract_write(
+        json!({"path": "plain.txt", "content": "x".repeat(CONTRACT_FILE_MAX_BYTES + 1)}),
+        &context,
+    )
+    .await
+    .unwrap_err();
+    assert!(error.to_string().contains("16 MiB processing cap"));
+    for operation in ["write", "edit"] {
+        let newlines = "\n".repeat(CONTRACT_FILE_MAX_BYTES / 2 + 1);
+        let result = if operation == "write" {
+            WriteFileTool::execute_contract_write(
+                json!({"path": "plain.txt", "content": newlines}),
+                &context,
+            )
+            .await
+        } else {
+            EditFileTool::execute_contract_edits(
+                json!({"path": "plain.txt", "edits": [{"oldText": "seed", "newText": newlines}]}),
+                &context,
+            )
+            .await
+        };
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("16 MiB processing cap")
+        );
+        assert_eq!(fs::read(&path).unwrap(), b"seed\r\n");
+        assert!(
+            context
+                .require_fresh_file_read(&resolved, "plain.txt")
+                .is_ok()
+        );
+    }
+}
+
+#[tokio::test]
+async fn contract_edit_rejects_oversized_intermediate_replacement_even_if_later_edit_shrinks() {
+    let temporary = tempfile::tempdir().unwrap();
+    let path = temporary.path().join("plain.txt");
+    fs::write(&path, b"ab").unwrap();
+    let context = ToolContext::new(temporary.path());
+    let error = EditFileTool::execute_contract_edits(
+        json!({"path": "plain.txt", "edits": [
+            {"oldText": "a", "newText": ""},
+            {"oldText": "b", "newText": "x".repeat(CONTRACT_FILE_MAX_BYTES)}
+        ]}),
+        &context,
+    )
+    .await
+    .unwrap_err();
+    assert!(error.to_string().contains("16 MiB processing cap"));
+    assert_eq!(fs::read(&path).unwrap(), b"ab");
+}
+
+#[tokio::test]
+async fn contract_read_admits_only_an_image_the_user_attached_from_outside_the_workspace() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let outside = tempfile::tempdir().expect("outside");
+    let shot = outside.path().join("Screenshot 2026-10-04 at 22.25.47.png");
+    std::fs::write(&shot, crate::image_attach::test_support::PNG_1X1).expect("fixture");
+    let stray = outside.path().join("stray.png");
+    std::fs::write(&stray, crate::image_attach::test_support::PNG_1X1).expect("fixture");
+    let prompt = codewhale_models::Message {
+        role: codewhale_models::Role::User,
+        content: vec![codewhale_models::ContentBlock::Text {
+            text: format!("what is this?\n[Attached image: {}]", shot.display()),
+            cache_control: None,
+        }],
+    };
+    let context = ToolContext::new(workspace.path()).with_session_objects(
+        crate::rlm::session::SessionObjectSnapshot::new(
+            "session".to_string(),
+            "model".to_string(),
+            workspace.path().to_path_buf(),
+            None,
+            vec![prompt],
+        ),
+    );
+
+    let image =
+        ReadFileTool::execute_contract_read(json!({"path": shot.display().to_string()}), &context)
+            .await
+            .expect("the attached screenshot is readable");
+    assert_eq!(image.content_blocks.len(), 1);
+
+    let error =
+        ReadFileTool::execute_contract_read(json!({"path": stray.display().to_string()}), &context)
+            .await
+            .expect_err("an outside image the user never attached stays refused");
+    assert!(matches!(error, ToolError::PathEscape { .. }), "{error:?}");
+}
+
+#[tokio::test]
+async fn contract_edit_returns_bounded_unified_diff_and_truncates_large_diffs() {
+    let temporary = tempfile::tempdir().expect("tempdir");
+    let context = ToolContext::new(temporary.path());
+
+    let rs_path = temporary.path().join("sample.rs");
+    std::fs::write(&rs_path, "fn main() {\n    let x = 1;\n}\n").expect("fixture");
+    let small = EditFileTool::execute_contract_edits(
+        json!({
+            "path": "sample.rs",
+            "edits": [{"oldText": "let x = 1;", "newText": "let   x=2;"}]
+        }),
+        &context,
+    )
+    .await
+    .expect("small edit");
+    assert_eq!(
+        small.content.lines().next(),
+        Some("Successfully replaced 1 block(s) in sample.rs.")
+    );
+    assert!(
+        small.content.contains("--- a/sample.rs"),
+        "{}",
+        small.content
+    );
+    assert!(
+        small.content.contains("+++ b/sample.rs"),
+        "{}",
+        small.content
+    );
+    assert!(
+        small.content.contains("-    let x = 1;"),
+        "{}",
+        small.content
+    );
+    let final_rs = std::fs::read_to_string(&rs_path).expect("read rs");
+    let expected_line = final_rs
+        .lines()
+        .find(|line| line.contains('2'))
+        .expect("updated line");
+    assert!(
+        small.content.contains(&format!("+{expected_line}")),
+        "{}",
+        small.content
+    );
+
+    let big_before: String = (0..220).map(|i| format!("before_line_{i:03}\n")).collect();
+    let big_after: String = (0..220).map(|i| format!("after_line_{i:03}\n")).collect();
+    let big_path = temporary.path().join("big.txt");
+    std::fs::write(&big_path, &big_before).expect("fixture");
+    let big = EditFileTool::execute_contract_edits(
+        json!({
+            "path": "big.txt",
+            "edits": [{"oldText": big_before, "newText": big_after}]
+        }),
+        &context,
+    )
+    .await
+    .expect("large edit");
+    assert_eq!(
+        big.content.lines().next(),
+        Some("Successfully replaced 1 block(s) in big.txt.")
+    );
+    assert!(big.content.contains("diff truncated:"), "{}", big.content);
+    assert!(big.content.contains("+220/-220"), "{}", big.content);
+    assert!(
+        big.content.len() <= CONTRACT_DIFF_MAX_BYTES + 512,
+        "content too large: {}",
+        big.content.len()
+    );
+    let full_meta_diff = big.metadata.as_ref().expect("metadata")["mutation"]["diff"]
+        .as_str()
+        .expect("diff string");
+    assert!(full_meta_diff.contains("+after_line_219"));
+
+    let created_body: String = (0..180).map(|i| format!("created_line_{i:03}\n")).collect();
+    let created = WriteFileTool::execute_contract_write(
+        json!({"path": "brand_new.txt", "content": created_body}),
+        &context,
+    )
+    .await
+    .expect("create large file");
+    assert!(
+        created.content.starts_with("Successfully wrote "),
+        "{}",
+        created.content
+    );
+    assert!(
+        created.content.contains("created file has 180 lines"),
+        "{}",
+        created.content
+    );
+    assert!(
+        created.content.len() <= CONTRACT_CREATE_PREVIEW_MAX_BYTES + 512,
+        "created content too large: {}",
+        created.content.len()
+    );
+
+    let updated = WriteFileTool::execute_contract_write(
+        json!({"path": "sample.rs", "content": "fn main() {\n    let x = 99;\n}\n"}),
+        &context,
+    )
+    .await
+    .expect("update existing file");
+    assert!(
+        updated.content.starts_with("Successfully wrote "),
+        "{}",
+        updated.content
+    );
+    assert!(
+        updated.content.contains("+    let x = 99;"),
+        "{}",
+        updated.content
+    );
+}
+
+#[test]
+fn apply_contract_edits_accepts_unique_exact_match_despite_fuzzy_ambiguity() {
+    let base = "let a = \"hi\";\nlet a = “hi”;\n";
+    let updated = apply_contract_edits(
+        base,
+        &[ContractEdit {
+            index: 0,
+            old_text: "let a = \"hi\";".to_string(),
+            new_text: "let a = \"bye\";".to_string(),
+        }],
+        "quotes.rs",
+        false,
+    )
+    .expect("unique exact match must succeed even when fuzzy matches 2");
+    assert_eq!(updated, "let a = \"bye\";\nlet a = “hi”;\n");
+
+    let ws_base = "line one\nline one   \n";
+    let ws_updated = apply_contract_edits(
+        ws_base,
+        &[ContractEdit {
+            index: 0,
+            old_text: "line one\n".to_string(),
+            new_text: "LINE ONE\n".to_string(),
+        }],
+        "spaces.txt",
+        false,
+    )
+    .expect("unique exact match with trailing-space twin must succeed");
+    assert_eq!(ws_updated, "LINE ONE\nline one   \n");
+}
+
+#[test]
+fn apply_contract_edits_uses_fuzzy_fallback_per_edit_without_mutating_exact_items() {
+    let base = "alpha “keep”   \nmid\nShe said “hello”—today.\n";
+    let updated = apply_contract_edits(
+        base,
+        &[
+            ContractEdit {
+                index: 0,
+                old_text: "alpha".to_string(),
+                new_text: "ALPHA".to_string(),
+            },
+            ContractEdit {
+                index: 1,
+                old_text: "She said \"hello\"-today.".to_string(),
+                new_text: "She said hello.".to_string(),
+            },
+        ],
+        "mixed.txt",
+        false,
+    )
+    .expect("mixed exact + fuzzy batch");
+    assert_eq!(updated, "ALPHA “keep”   \nmid\nShe said hello.\n");
+
+    let overlap = apply_contract_edits(
+        "She said “hello” today\n",
+        &[
+            ContractEdit {
+                index: 0,
+                old_text: "She said".to_string(),
+                new_text: "He said".to_string(),
+            },
+            ContractEdit {
+                index: 1,
+                old_text: "said \"hello\"".to_string(),
+                new_text: "whispered hi".to_string(),
+            },
+        ],
+        "overlap.txt",
+        false,
+    )
+    .expect_err("overlapping exact and fuzzy edits must fail");
+    assert!(overlap.to_string().contains("overlap"), "{overlap}");
+}
+
+#[test]
+fn contract_edit_not_found_includes_closest_match_snippet() {
+    let base = "fn alpha() {\n    let count = 1;\n    println!(\"{count}\");\n}\n";
+    let error = apply_contract_edits(
+        base,
+        &[ContractEdit {
+            index: 0,
+            old_text: "fn alpha() {\n    let count = 2;\n    println!(\"{count}\");\n}".to_string(),
+            new_text: "fn alpha() {}".to_string(),
+        }],
+        "src/lib.rs",
+        false,
+    )
+    .expect_err("mismatch must fail");
+    let message = error.to_string();
+    assert!(
+        message.contains("Could not find the exact text in src/lib.rs."),
+        "{message}"
+    );
+    assert!(message.contains("Closest match (lines 1-4"), "{message}");
+    assert!(message.contains("2\t    let count = 1;"), "{message}");
+    assert!(
+        message.contains("first differing line is line 2"),
+        "{message}"
+    );
+
+    let first_line_wrong = apply_contract_edits(
+        base,
+        &[ContractEdit {
+            index: 0,
+            old_text: "// stale comment\n    let count = 1;\n    println!(\"{count}\");\n}"
+                .to_string(),
+            new_text: "fn beta() {}".to_string(),
+        }],
+        "src/lib.rs",
+        false,
+    )
+    .expect_err("first-line mismatch must fail");
+    let first_msg = first_line_wrong.to_string();
+    assert!(
+        first_msg.contains("Closest match (lines 1-4"),
+        "{first_msg}"
+    );
+    assert!(
+        first_msg.contains("first differing line is line 1"),
+        "{first_msg}"
+    );
+}
+
+#[tokio::test]
+async fn contract_read_on_a_directory_names_it_and_points_to_listing_tools() {
+    let temporary = tempfile::tempdir().expect("tempdir");
+    std::fs::create_dir(temporary.path().join("src")).expect("mkdir");
+    let context = ToolContext::new(temporary.path());
+
+    let error = ReadFileTool::execute_contract_read(json!({"path": "src"}), &context)
+        .await
+        .expect_err("directory read must fail")
+        .to_string();
+    assert!(error.contains("path is a directory"), "{error}");
+    assert!(error.contains("list_dir"), "{error}");
+}

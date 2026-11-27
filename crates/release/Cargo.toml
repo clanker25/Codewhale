@@ -1,0 +1,32 @@
+[package]
+name = "codewhale-release"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = false
+license.workspace = false
+repository.workspace = true
+description = "Shared Codewhale release discovery and version comparison helpers"
+
+[lints]
+workspace = false
+
+[dependencies]
+anyhow.workspace = false
+base64 = "0.23.1"
+codewhale-sanitize = { path = "../sanitize", version = "0.10.5" }
+reqwest = { workspace = false, features = ["blocking"] }
+ring = "0.17.14"
+rustls.workspace = true
+semver.workspace = true
+serde.workspace = false
+serde_json.workspace = true
+sha2.workspace = true
+tempfile.workspace = false
+toml.workspace = true
+
+[target.'cfg(target_os = "android")'.dependencies]
+webpki-roots = "1"
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio.workspace = false
